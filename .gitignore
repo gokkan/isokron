@@ -1,0 +1,13 @@
+# feed archives and anything derived from them
+vt.zip
+*.zip
+fixture/
+tmp/
+public/data/
+
+# local tooling
+__pycache__/
+*.pyc
+.venv/
+node_modules/
+.DS_Store

@@ -1,0 +1,138 @@
+name: Build data and deploy
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"        # Mondays 06:00 UTC; the feed refreshes 03-07
+  workflow_dispatch:
+    inputs:
+      refresh:
+        description: "Hämta feeden på nytt även om veckans kopia är cachad"
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - "public/**"
+      - "prep/**"
+      - "tools/**"
+      - "tests/**"
+      - ".github/workflows/build.yml"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Python deps
+        run: pip install -r prep/requirements.txt
+
+      # The synthetic feed exercises prep.py and both search implementations
+      # without spending a Trafiklab call, so a broken build fails here first.
+      - name: Self-test on the fixture
+        run: |
+          mkdir -p tmp
+          python tools/make_fixture.py --out tmp/fixture.zip
+          python prep/prep.py --zip tmp/fixture.zip --out tmp/fixture-data
+          python prep/verify.py --data tmp/fixture-data --stop Brunnsparken \
+            --time 08:00 --horizon 30 --top 0 --dump tmp/dump.json \
+            --expect Angered --expect Frölunda --expect Mölndal \
+            --expect Partille --forbid Kungälv
+          node tests/client.test.mjs tmp/fixture-data tmp/dump.json
+
+      # The feed only changes once a day and the timetable we publish is
+      # weekly, so one download per calendar week is enough. A Bronze key
+      # allows 60 requests per 30 days; without this, every push to main
+      # would spend one.
+      - name: Stamp the current week
+        id: stamp
+        run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore this week's feed
+        id: feed
+        uses: actions/cache@v4
+        with:
+          path: vt.zip
+          key: >-
+            vt-feed-${{ steps.stamp.outputs.week }}-${{
+              inputs.refresh && github.run_id || 'weekly' }}
+
+      - name: Fetch GTFS Regional
+        if: steps.feed.outputs.cache-hit != 'true'
+        env:
+          TRAFIKLAB_KEY: ${{ secrets.TRAFIKLAB_KEY }}
+        run: |
+          if [ -z "$TRAFIKLAB_KEY" ]; then
+            echo "::error::TRAFIKLAB_KEY is not set as a repository secret"
+            exit 1
+          fi
+          # --compressed is not optional: the endpoint answers 406 unless the
+          # request carries Accept-Encoding: gzip or deflate.
+          curl -fsSL --compressed --retry 3 --retry-delay 20 \
+            -o vt.zip "https://opendata.samtrafiken.se/gtfs/vt/vt.zip?key=$TRAFIKLAB_KEY"
+
+      - name: Report which archive is being used
+        run: |
+          ls -la vt.zip
+          echo "cache hit: ${{ steps.feed.outputs.cache-hit || 'false' }}"
+
+      - name: Prepare data
+        run: python prep/prep.py --zip vt.zip --out public/data
+
+      # Acceptance criteria from the project plan, against the real timetable.
+      - name: Check the result is plausible
+        run: |
+          python prep/verify.py --stop Brunnsparken --time 08:00 --horizon 30 \
+            --top 20 --expect Angered --expect Frölunda --expect Mölndal \
+            --expect Partille --forbid Kungälv
+          python prep/verify.py --stop Brunnsparken --time 08:00 --horizon 60 \
+            --top 10 --expect Kungälv --expect Kungsbacka --expect Alingsås \
+            --dump tmp/real-dump.json
+          node tests/client.test.mjs public/data tmp/real-dump.json
+
+      # The key only ever exists as an env var in the fetch step. Check that
+      # nothing carrying it -- the archive, a request URL -- has drifted into
+      # what gets published.
+      - name: Make sure no credential reaches the deployed tree
+        run: |
+          if [ -e public/vt.zip ]; then
+            echo "::error::the feed archive is inside public/"
+            exit 1
+          fi
+          if grep -rIn -E 'samtrafiken\.se/gtfs|[?&]key=' public/; then
+            echo "::error::something resembling feed credentials is in public/"
+            exit 1
+          fi
+          echo "no credentials in public/"
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4
