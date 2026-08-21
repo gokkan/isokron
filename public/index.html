@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
 <title>Hur långt kommer du? — kollektivtrafik i Västra Götaland</title>
-<meta name="description" content="Klicka var som helst i Västra Götaland och se hur långt du kommer med Västtrafik på 15, 30 eller 60 minuter en vardagsmorgon.">
+<meta name="description" content="Klicka var som helst i Västra Götaland och se hur långt du kommer med Västtrafik på 15 till 120 minuter en vardagsmorgon.">
 <link rel="preconnect" href="https://basemaps.cartocdn.com" crossorigin>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/maplibre-gl@4.7.1/dist/maplibre-gl.css">
 <link rel="stylesheet" href="style.css">
@@ -33,12 +33,14 @@
     Västtrafik, och varje hållplats tänds i den minut du kommer fram.</p>
 
   <div class="control">
-    <span class="label">Tidshorisont</span>
+    <span class="label">Tidshorisont <span class="unit">minuter</span></span>
     <div class="segmented" id="horizon" role="group" aria-label="Tidshorisont">
-      <button type="button" data-h="15">15 min</button>
-      <button type="button" data-h="30" class="on">30 min</button>
-      <button type="button" data-h="45">45 min</button>
-      <button type="button" data-h="60">60 min</button>
+      <button type="button" data-h="15">15</button>
+      <button type="button" data-h="30" class="on">30</button>
+      <button type="button" data-h="45">45</button>
+      <button type="button" data-h="60">60</button>
+      <button type="button" data-h="90">90</button>
+      <button type="button" data-h="120">120</button>
     </div>
   </div>
 

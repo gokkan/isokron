@@ -1,7 +1,7 @@
 # Isokronkarta för Västtrafik
 
 Klicka på en punkt i Västra Götaland och se hur långt du kommer med
-kollektivtrafik på 15, 30 eller 60 minuter en vardagsmorgon — animerat minut
+kollektivtrafik på 15 till 120 minuter en vardagsmorgon — animerat minut
 för minut.
 
 Statisk sajt. All sökning sker i webbläsaren; ingen server, inget API-anrop
@@ -94,10 +94,12 @@ komprimera `application/octet-stream`.
 
 Fyra, alla medvetna:
 
-1. **Tidsfönstret är 05:45–11:15, inte 06:00–10:00.** Skjutreglaget går till
-   10:00 och horisonten till 60 minuter, så avgångar måste finnas till 11:00 —
-   annars kapas resultatet mot datakanten, vilket är precis den hårda kant
-   acceptanskriterierna förbjuder. Kostar ~35 % fler connections.
+1. **Tidsfönstret är 05:45–12:15, inte 06:00–10:00.** Skjutreglaget går till
+   10:15 och den längsta horisonten är 120 minuter, så avgångar måste finnas
+   till 12:15 — annars kapas resultatet mot datakanten, vilket är precis den
+   hårda kant acceptanskriterierna förbjuder. Gränsen härleds ur `HORIZONS` i
+   `app.js`: lägger du till en längre horisont måste `--window-end` följa med,
+   annars trunkeras sena avgångar tyst.
 2. **Trip-medveten CSA.** Planens `arr[c.from] <= c.dep` tillåter byte mellan
    olika turer på noll sekunder. Klienten bär i stället en `boarded`-flagga per
    tur: att sitta kvar är gratis, att kliva på en ny tur kostar `MIN_CHANGE`

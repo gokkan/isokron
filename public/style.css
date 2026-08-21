@@ -192,6 +192,8 @@ html, body {
   border-radius: 8px;
 }
 
+.label .unit { font-weight: 500; letter-spacing: .04em; opacity: .75; }
+
 .segmented button {
   padding: 7px 0;
   border: 0;

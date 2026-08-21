@@ -411,9 +411,11 @@ def main(argv=None):
     ap.add_argument("--date", default="auto",
                     help="YYYY-MM-DD, or 'auto' for the next ordinary Tuesday")
     ap.add_argument("--window-start", default="05:45")
-    ap.add_argument("--window-end", default="11:15",
+    ap.add_argument("--window-end", default="12:15",
                     help="last departure kept; must exceed the latest "
-                         "selectable start time by at least one horizon")
+                         "selectable start time by the longest horizon the "
+                         "frontend offers, or late departures get truncated "
+                         "against the data edge")
     ap.add_argument("--walk-speed", type=float, default=5.0, help="km/h")
     ap.add_argument("--transfer-radius", type=float, default=400.0,
                     help="metres")

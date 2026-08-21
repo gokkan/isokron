@@ -11,6 +11,10 @@ const DATA = 'data/';
 const WALK_MPS = 5000 / 3600;      // 5 km/h, as the crow flies
 const MIN_CHANGE = 60;             // seconds needed to board a different trip
 const ACCESS_DEFAULT_MIN = 10;     // how far people are assumed to walk to a stop
+// The offered horizons, longest last. The data window must extend past the
+// latest selectable departure by HORIZONS[last], or a late start runs into the
+// edge of the data and the result gets silently truncated.
+const HORIZONS = [15, 30, 45, 60, 90, 120];
 const LEG_ACCESS = -2;             // reached on foot from the click point
 const LEG_WALK = -1;               // reached on foot from another stop
 const INF = 0x7fffffff;
@@ -723,7 +727,7 @@ function readURL() {
   const t = p.get('t');
   if (t && /^\d{4}$/.test(t)) out.depart = +t.slice(0, 2) * 60 + +t.slice(2);
   const h = p.get('h');
-  if (h && ['15', '30', '45', '60'].includes(h)) out.horizon = Number(h);
+  if (h && HORIZONS.includes(Number(h))) out.horizon = Number(h);
   const w = p.get('w');
   if (w && ['5', '10', '20'].includes(w)) out.access = Number(w);
   return out;
@@ -911,7 +915,9 @@ async function boot() {
   // keep it inside what a 60 minute horizon can actually reach.
   const slider = el('depart');
   slider.min = String(Math.ceil(D.header.window_start / 60));
-  slider.max = String(Math.floor((D.header.window_end - 3600) / 60));
+  // keep every horizon reachable from the latest selectable departure
+  const longest = HORIZONS[HORIZONS.length - 1] * 60;
+  slider.max = String(Math.floor((D.header.window_end - longest) / 60));
   setDepart(Math.min(Math.max(wanted.depart ?? 480, +slider.min), +slider.max));
   setHorizon(wanted.horizon ?? 30);
   setAccess(wanted.access ?? ACCESS_DEFAULT_MIN);
