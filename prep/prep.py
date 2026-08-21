@@ -410,8 +410,8 @@ def main(argv=None):
     ap.add_argument("--out", default="public/data")
     ap.add_argument("--date", default="auto",
                     help="YYYY-MM-DD, or 'auto' for the next ordinary Tuesday")
-    ap.add_argument("--window-start", default="05:45")
-    ap.add_argument("--window-end", default="12:15",
+    ap.add_argument("--window-start", default="05:00")
+    ap.add_argument("--window-end", default="22:00",
                     help="last departure kept; must exceed the latest "
                          "selectable start time by the longest horizon the "
                          "frontend offers, or late departures get truncated "

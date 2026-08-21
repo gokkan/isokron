@@ -1,8 +1,8 @@
 # Isokronkarta för Västtrafik
 
 Klicka på en punkt i Västra Götaland och se hur långt du kommer med
-kollektivtrafik på 15 till 120 minuter en vardagsmorgon — animerat minut
-för minut.
+kollektivtrafik på 15 till 120 minuter en vardag — animerat minut för minut,
+från första morgonturen till sen kväll.
 
 Statisk sajt. All sökning sker i webbläsaren; ingen server, inget API-anrop
 från klienten. Datat förbereds en gång i veckan i GitHub Actions.
@@ -184,8 +184,15 @@ hela `public/` som Pages-artefakt. Datat committas aldrig.
 ## Icke-mål i v1
 
 Gaturoutad gång (fågelvägen räcker), realtidsdata (Västtrafik levererar ingen
-GTFS-RT till Trafiklab), POI-lager, andra operatörers feeds, kvällar och
-helger.
+GTFS-RT till Trafiklab), POI-lager, andra operatörers feeds, helger, och
+nattrafiken efter 22:00.
+
+Kvällarna kom med i efterhand. Fönstret är 05:00–22:00, vilket är 17 timmar och
+ryms med marginal i de 18 timmar och 12 minuter som `dep`/`arr` klarar som
+Uint16 sekunder från fönstrets start. Ska nattrafiken in — 24 000 avgångar
+mellan 23:00 och 03:00 — måste de fälten bli Uint32. Headern deklarerar redan
+datatyp per array och klienten läser den, så det är en avgränsad ändring i
+`prep.py`, inte en omskrivning.
 
 ## Attribution
 

@@ -639,6 +639,7 @@ let horizonMin = 30;
 let departMin = 480;
 let accessMin = ACCESS_DEFAULT_MIN;
 let showWalkArea = false;
+let pendingNote = '';   // explanation the next search should carry
 
 function departSeconds() { return departMin * 60; }
 
@@ -666,14 +667,16 @@ function runFrom(lon, lat) {
   }
 
   const walkMin = Math.round(current.nearest / WALK_MPS / 60);
+  const note = pendingNote ? ' ' + pendingNote : '';
+  pendingNote = '';
   if (current.count === 0) {
     say('Ingen hållplats inom ' + accessMin + ' minuters gång — närmaste ' +
         'ligger ' + walkMin + ' minuter bort. Öka gångviljan, eller läs det ' +
-        'som svaret: härifrån reser man inte kollektivt.');
+        'som svaret: härifrån reser man inte kollektivt.' + note);
   } else {
     say('Sökning: ' + ms.toFixed(0) + ' ms, ' +
         current.scanned.toLocaleString('sv-SE') + ' avgångar granskade. ' +
-        'Närmaste hållplats: ' + walkMin + ' min gång.');
+        'Närmaste hållplats: ' + walkMin + ' min gång.' + note);
   }
   writeURL(lon, lat);
   el('clock').hidden = false;
@@ -683,10 +686,29 @@ function runFrom(lon, lat) {
   play();
 }
 
+/* The latest departure that still fits inside the prepared data. It depends
+ * on the horizon, so a two hour search stops two hours before the window ends
+ * while a fifteen minute one runs almost to the edge. Locking the slider at
+ * the worst case would throw away most of an evening. */
+function latestDeparture() {
+  if (!D.header) return 600;
+  return Math.floor((D.header.window_end - horizonMin * 60) / 60);
+}
+
 function setHorizon(h) {
   horizonMin = h;
   for (const b of el('horizon').children) {
     b.classList.toggle('on', Number(b.dataset.h) === h);
+  }
+  const slider = el('depart');
+  const max = latestDeparture();
+  slider.max = String(max);
+  if (departMin > max) {
+    setDepart(max);
+    // the search that follows will overwrite the status line, so hand the
+    // explanation to it rather than saying it here and losing it
+    pendingNote = 'Avgången flyttades till ' + el('departOut').textContent +
+      ' — tidtabellen räcker inte längre än så för ' + h + ' minuter.';
   }
 }
 
@@ -915,11 +937,9 @@ async function boot() {
   // keep it inside what a 60 minute horizon can actually reach.
   const slider = el('depart');
   slider.min = String(Math.ceil(D.header.window_start / 60));
-  // keep every horizon reachable from the latest selectable departure
-  const longest = HORIZONS[HORIZONS.length - 1] * 60;
-  slider.max = String(Math.floor((D.header.window_end - longest) / 60));
-  setDepart(Math.min(Math.max(wanted.depart ?? 480, +slider.min), +slider.max));
-  setHorizon(wanted.horizon ?? 30);
+  setHorizon(wanted.horizon ?? 30);          // also sets the slider maximum
+  setDepart(Math.min(Math.max(wanted.depart ?? 480, +slider.min),
+                     latestDeparture()));
   setAccess(wanted.access ?? ACCESS_DEFAULT_MIN);
 
   say('Klart. Klicka på kartan.');
