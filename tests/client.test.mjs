@@ -134,15 +134,50 @@ if (dumpFile) {
   console.log(`  note  ${modeMismatch} of ${ref.stop.length} stops differ in `
               + 'dominant mode (last-leg vs longest-leg labelling)');
 
-  // The dashed outline is sampled from the same geometry the search used, so
-  // a map that draws a circle straight over the water while refusing to seed
-  // anything on the far side is a contradiction worth catching here.
+  // The outline is drawn from a field, and the field is meant to be the same
+  // rule the search seeds by. The contradiction worth catching is a stop the
+  // search refused to seed sitting inside the drawn line anyway -- a map
+  // saying "walkable" about ground it will not let you walk to.
   if (got.blocked > 0) {
     const budget = Math.min(ref.horizon, ref.access) * app.WALK_MPS;
-    check('the drawn outline is cut where the walk was blocked',
-          !!got.reach && Math.min(...got.reach) < budget - 1,
-          got.reach ? `shortest ray ${Math.min(...got.reach).toFixed(0)} m of `
-                      + `${budget.toFixed(0)} m` : 'no outline sampled');
+    const F = got.field;
+    check('the walk field was built', !!F && F.sources > 0,
+          F ? `${F.sources} sources` : 'no field');
+    if (F) {
+      const B = app.D.barriers;
+      const phi = ref.lat * Math.PI / 180;
+      const kx = 6371008.8 * Math.cos(phi) * Math.PI / 180;
+      const ky = 6371008.8 * Math.PI / 180;
+      const nCand = app.collectSegments(B, ref.lon, ref.lat, budget, kx, ky);
+      const exits = app.gateExits(B, nCand, ref.lon, ref.lat, budget, kx, ky,
+                                  app.SHORE_SLACK);
+      let inside = 0, blocked = 0, missed = 0;
+      for (let i = 0; i < app.D.nStops; i++) {
+        const x = (app.D.stops.lon[i] - ref.lon) * kx;
+        const y = (app.D.stops.lat[i] - ref.lat) * ky;
+        const direct = Math.hypot(x, y);
+        if (direct > budget) continue;
+        const w = app.walkDistance(B, nCand, exits, ref.lon, ref.lat,
+                                   app.D.stops.lon[i], app.D.stops.lat[i],
+                                   direct, budget, kx, ky, app.SHORE_SLACK);
+        const drawn = app.fieldValue(B, F.sources, budget, x, y) <= budget;
+        if (w < 0) { blocked++; if (drawn) inside++; } else if (!drawn) missed++;
+      }
+      // Not zero by construction: the field asks whether a point is in view
+      // along one of REACH_RAYS directions, and a spit of land narrower than
+      // the gap between two rays can hide between them. Against the whole
+      // Gothenburg geometry that is a couple of points in five thousand, so
+      // the bar is a rate rather than a count -- and it is still stricter
+      // than the rings this replaced, which were three to five times worse.
+      check('almost no stop the water blocks lies inside the drawn outline',
+            inside <= Math.max(1, blocked * 0.02),
+            `${inside} of ${blocked} blocked stops drawn as reachable`);
+      // The other direction is allowed to differ: the search forgives a
+      // crossing within SHORE_SLACK of either end so that a stop charted a few
+      // metres into the water still counts, and the drawing does not.
+      console.log(`  note  ${missed} reachable stops sit outside the outline `
+                  + `(shore slack, ${app.SHORE_SLACK} m)`);
+    }
   }
 
   const t = process.hrtime.bigint();

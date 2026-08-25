@@ -244,6 +244,24 @@ Fem, alla medvetna:
    faller allt tillbaka på fågelvägen, exakt som förut — och det är den vägen
    ett bygge utan geometri går.
 
+   **Den streckade konturen ritas ur ett fält, inte som ringar.** Varje källa
+   — klickpunkten och varje bro gången hinner betala — ger en siktprofil: hur
+   långt ögat når i varje riktning innan en strand tar emot. Tillsammans säger
+   de vad gången kostar var som helst, `min över källor av kostnad + avstånd`
+   där punkten syns, och konturen är den nivåkurvan vid antalet gångna meter.
+   Förut var det en ring per källa, vilket fungerade vid älven men blev ett
+   spindelnät i centrala staden, där det går en kanal med bro var tredje
+   kvarter: tjugotvå ringar ovanpå varandra. Nu är det en linje, med hål där
+   hål hör hemma.
+
+   Fältet byggs i ett rutnät på 128 × 128 en gång per klick — 4–9 ms vid
+   Brunnsparken, noll kronor för ett klick utan vatten i närheten — och varje
+   bildruta drar bara nivåkurvan ur det, 0,3 ms. Två saker att veta om
+   ritningen: den har ingen slack, så ett kajläge som sökningen förlåter kan
+   hamna strax utanför linjen, och en vattenstrimma smalare än en rutnätscell
+   ritas inte alls. Under rutnätet har ritningen inget att säga, och att låtsas
+   annat skulle bara ge prickar.
+
    Kvarvarande fel, och de är kända: bara **en** bro per gångsträcka söks, så
    en väg som kräver både älv och kanal hittas inte; på land hindrar
    ingenting, varken motorväg, järnväg eller stup; och en genväg som skär
@@ -284,6 +302,12 @@ python prep/verify.py --data tmp/fixture-data --at 57.7105,11.9660 `
 `prep/verify.py` och sökningen i `public/app.js` är samma algoritm skriven två
 gånger med flit: den ena kan köras utan webbläsare, den andra måste köras i
 en. `tests/client.test.mjs` finns för att de ska fortsätta vara överens.
+
+Samma test håller ritningen ärlig: ingen hållplats som vattnet stoppar får
+ligga innanför den streckade linjen. Kravet är en andel och inte noll, för
+fältet frågar om sikt längs 256 strålar och en landtunga smalare än glappet
+mellan två strålar kan gömma sig däremellan — mot hela Göteborgsgeometrin är
+det ett par punkter av femtusen.
 
 Uppspelningen är ett tidstillstånd, inte en engångsanimering: `setTime()` är
 det enda som får skriva `frameTime`, och både play-slingan och tidslinjen går

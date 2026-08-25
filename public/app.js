@@ -22,7 +22,9 @@ const EARTH_CIRC = 40075016.686;
 const EARTH_R = 6371008.8;
 const TAU = 6.283185307179586;
 const SHORE_SLACK = 35;            // see the barrier section for what this is
-const REACH_RAYS = 128;            // directions the drawn walk outline samples
+const REACH_RAYS = 256;            // directions one source's view is sampled in
+const FIELD_CELLS = 128;           // grid the drawn walk outline is traced on
+const MAX_SOURCES = 32;            // the click plus the bridges it can pay for
 
 const el = (id) => document.getElementById(id);
 
@@ -208,10 +210,17 @@ function buildBarriers(header, a) {
     gateBLon: a.gate_b_lon, gateBLat: a.gate_b_lat, gateLen: a.gate_len,
     nGates: a.gate_len.length,
     meta: header,
-    // scratch, so a search allocates nothing: which segments the walking disc
-    // can reach at all, filled once per click
+    // Scratch, so a search allocates nothing. `cand` is the segments the
+    // walking disc can reach at all, `sub` the narrower list one source needs,
+    // and the src* arrays are the click and the bridge landings it can pay
+    // for, each with REACH_RAYS of how far the eye gets before the bank.
     cand: new Uint32Array(count),
-    reach: new Float32Array(REACH_RAYS),
+    sub: new Uint32Array(count),
+    prof: new Float32Array(MAX_SOURCES * REACH_RAYS),
+    srcCost: new Float64Array(MAX_SOURCES),
+    srcX: new Float64Array(MAX_SOURCES),
+    srcY: new Float64Array(MAX_SOURCES),
+    field: newField(FIELD_CELLS),
   };
 }
 
@@ -315,27 +324,271 @@ function walkDistance(B, nCand, exits, alon, alat, blon, blat, direct, budget,
   return best;
 }
 
-/* How far the walk gets in each of REACH_RAYS directions before it hits
- * water. Sampled once per search, not per frame; the animation only clips it
- * shorter as the clock runs. No slack here: this is a drawing, and a ray that
- * shrugged off the bank it starts on would draw a circle straight across the
- * river. */
-function reachProfile(B, nCand, out, lon, lat, budget, kx, ky) {
-  const bl = B.lon, ba = B.lat, cand = B.cand;
+/* ---------------------------------------------------------- drawn outline
+ *
+ * One dashed ring per source -- the click, then the far side of every bridge
+ * -- reads well where a river is the only barrier, and badly everywhere else.
+ * Central Gothenburg has a canal every few hundred metres and a bridge over
+ * each, so a click there drew twenty overlapping rings: a scribble, not an
+ * answer.
+ *
+ * Drawn from what the search believes instead. Each source has a visibility
+ * profile, how far the eye gets in every direction before a bank stops it,
+ * and together they say what the walk costs anywhere:
+ *
+ *     d(p) = min over sources s of  cost(s) + |p - s|,  p in sight of s
+ *
+ * That is a field, sampled on a grid once per search, and the outline is its
+ * contour at the metres walked so far. One line, holes and all: the river
+ * stays a hole, a bridged canal closes over, and the animation is the same
+ * field contoured at a lower level.
+ */
+
+function newField(n) {
+  const edges = 2 * n * (n + 1);       // horizontal ids first, then vertical
+  return {
+    n, step: 0, budget: 0, sources: 0,
+    d: new Float32Array((n + 1) * (n + 1)),
+    // marching-squares scratch: where the contour cuts each grid edge, and
+    // which cuts join which, so a dash runs along the line instead of
+    // restarting in every cell it passes through
+    ex: new Float32Array(edges), ey: new Float32Array(edges),
+    linkA: new Int32Array(edges), linkB: new Int32Array(edges),
+    seen: new Uint8Array(edges), chain: new Int32Array(edges + 1),
+  };
+}
+
+/* The segments one source can touch, taken from the click's list: a bridge
+ * landing with two hundred metres left sees far less than the whole walk. */
+function narrow(B, nCand, lon, lat, radius, kx, ky) {
+  const dLon = radius / kx, dLat = radius / ky;
+  const minLon = lon - dLon, maxLon = lon + dLon;
+  const minLat = lat - dLat, maxLat = lat + dLat;
+  const bl = B.lon, ba = B.lat, cand = B.cand, sub = B.sub;
+  let n = 0;
+  for (let k = 0; k < nCand; k++) {
+    const p = cand[k];
+    const x0 = bl[p], x1 = bl[p + 1], y0 = ba[p], y1 = ba[p + 1];
+    if ((x0 < minLon && x1 < minLon) || (x0 > maxLon && x1 > maxLon)) continue;
+    if ((y0 < minLat && y1 < minLat) || (y0 > maxLat && y1 > maxLat)) continue;
+    sub[n++] = p;
+  }
+  return n;
+}
+
+/* How far the walk gets from one source in each of REACH_RAYS directions
+ * before it hits water. No slack here: this is a drawing, and a ray that
+ * shrugged off the bank it starts on would draw straight across the river. */
+function reachProfile(B, nSub, base, lon, lat, budget, kx, ky) {
+  const bl = B.lon, ba = B.lat, sub = B.sub, prof = B.prof;
   for (let r = 0; r < REACH_RAYS; r++) {
     const angle = r * TAU / REACH_RAYS;
     // a unit vector in metres, expressed in degrees
     const ux = Math.cos(angle) / kx, uy = Math.sin(angle) / ky;
     let best = budget;
-    for (let k = 0; k < nCand; k++) {
-      const p = cand[k];
+    for (let k = 0; k < nSub; k++) {
+      const p = sub[k];
       const t = segHit(lon, lat, lon + ux * budget, lat + uy * budget,
                        bl[p], ba[p], bl[p + 1], ba[p + 1]);
       if (t >= 0 && t * budget < best) best = t * budget;
     }
-    out[r] = best;
+    prof[base + r] = best;
   }
-  return out;
+}
+
+/* Walking metres from the click to a point in metres east and north of it,
+ * as the drawing understands it: the cheapest source that can see the point,
+ * or Infinity if none can reach it inside the budget. Sources are in cost
+ * order, so once something is found nothing dearer can beat it. */
+function fieldValue(B, nSrc, budget, x, y) {
+  const cost = B.srcCost, sx = B.srcX, sy = B.srcY, prof = B.prof;
+  let best = Infinity;
+  for (let s = 0; s < nSrc; s++) {
+    const c = cost[s];
+    if (c >= best) break;
+    const dx = x - sx[s], dy = y - sy[s];
+    const d = Math.sqrt(dx * dx + dy * dy);
+    // out of the walk's reach from here, so nothing about the view matters
+    if (c + d > budget || c + d >= best) continue;
+    let a = Math.atan2(dy, dx);
+    if (a < 0) a += TAU;
+    const i = (a * REACH_RAYS / TAU) | 0;
+    const base = s * REACH_RAYS;
+    const near = prof[base + (i % REACH_RAYS)];
+    const next = prof[base + ((i + 1) % REACH_RAYS)];
+    // the shorter of the two rays either side: between samples the bank is
+    // guessed at, and guessing short keeps the outline on the dry side
+    if (d > (near < next ? near : next)) continue;
+    best = c + d;
+  }
+  return best;
+}
+
+/* The click, plus the far side of every bridge it can pay for -- the same
+ * list the search seeds from, so the drawing cannot promise more or less than
+ * the search delivers. Being able to reach a landing cheaply some other way
+ * is no reason to drop it: what makes a source a source is that the walk sees
+ * the world afresh from there, around whatever pier or quay hid it before.
+ *
+ * Two landings within a stride of each other are the one place to save work,
+ * and MAX_SOURCES is the ceiling. Exits arrive cheapest first, so a click with
+ * more bridges in range than that keeps the ones the walk reaches soonest. */
+function buildSources(B, nCand, exits, lon, lat, budget, kx, ky) {
+  B.srcCost[0] = 0;
+  B.srcX[0] = 0;
+  B.srcY[0] = 0;
+  reachProfile(B, narrow(B, nCand, lon, lat, budget, kx, ky), 0,
+               lon, lat, budget, kx, ky);
+  let n = 1;
+  for (let k = 0; k < exits.length && n < MAX_SOURCES; k++) {
+    const e = exits[k];
+    const left = budget - e.cost;
+    if (left < 60) continue;                   // too little left to be visible
+    const x = (e.lon - lon) * kx, y = (e.lat - lat) * ky;
+    let twin = false;
+    for (let s = 1; s < n && !twin; s++) {
+      const dx = x - B.srcX[s], dy = y - B.srcY[s];
+      twin = dx * dx + dy * dy < 100 && B.srcCost[s] <= e.cost;
+    }
+    if (twin) continue;
+    B.srcCost[n] = e.cost;
+    B.srcX[n] = x;
+    B.srcY[n] = y;
+    reachProfile(B, narrow(B, nCand, e.lon, e.lat, left, kx, ky),
+                 n * REACH_RAYS, e.lon, e.lat, left, kx, ky);
+    n++;
+  }
+  return n;
+}
+
+/* The field over a square of side 2 * budget about the click. Outside the
+ * budget circle nothing is reachable whatever bridge is involved -- a bridge
+ * costs at least the distance to its far landing, so the triangle inequality
+ * holds -- which leaves the corners free. */
+function walkField(B, nSrc, budget) {
+  const F = B.field, n = F.n, d = F.d;
+  F.sources = nSrc;
+  const step = 2 * budget / n;
+  const budget2 = budget * budget;
+  for (let iy = 0, at = 0; iy <= n; iy++) {
+    const y = iy * step - budget;
+    for (let ix = 0; ix <= n; ix++, at++) {
+      const x = ix * step - budget;
+      d[at] = x * x + y * y > budget2
+        ? Infinity : fieldValue(B, nSrc, budget, x, y);
+    }
+  }
+  F.step = step;
+  F.budget = budget;
+  return F;
+}
+
+/* Which grid edges a cell's contour cuts, by the corners that are inside:
+ * bit 0 is the top left corner and the rest run clockwise, edge 0 is the top
+ * edge and likewise. The two saddles cut four edges and are resolved the same
+ * way every time, which is all consistency needs. */
+const MS_CUTS = [
+  [], [3, 0], [0, 1], [3, 1], [1, 2], [3, 0, 1, 2], [0, 2], [3, 2],
+  [2, 3], [2, 0], [0, 1, 2, 3], [2, 1], [1, 3], [1, 0], [0, 3], [],
+];
+
+/* Where the contour cuts one edge of one cell, placed the first time an edge
+ * is asked for and shared with the cell on the other side. */
+function edgeCut(F, which, ix, iy, v0, v1, v2, v3, level) {
+  const n = F.n, step = F.step, budget = F.budget, nH = n * (n + 1);
+  let id, a, b;
+  if (which === 0) { id = iy * n + ix; a = v0; b = v1; }
+  else if (which === 1) { id = nH + iy * (n + 1) + ix + 1; a = v1; b = v2; }
+  else if (which === 2) { id = (iy + 1) * n + ix; a = v3; b = v2; }
+  else { id = nH + iy * (n + 1) + ix; a = v0; b = v3; }
+  if (F.linkA[id] < 0) {
+    // Half way when one end is out of reach: the bank is somewhere in the
+    // cell and the field cannot say where, so it splits the difference.
+    let t = 0.5;
+    if (a < Infinity && b < Infinity && b !== a) {
+      t = (level - a) / (b - a);
+      if (t < 0) t = 0; else if (t > 1) t = 1;
+    }
+    if (which === 0 || which === 2) {
+      F.ex[id] = (ix + t) * step - budget;
+      F.ey[id] = (which === 0 ? iy : iy + 1) * step - budget;
+    } else {
+      F.ex[id] = (which === 1 ? ix + 1 : ix) * step - budget;
+      F.ey[id] = (iy + t) * step - budget;
+    }
+  }
+  return id;
+}
+
+/* The contour at `level`, as one path in canvas pixels: `cx`,`cy` is the
+ * click and `ux`,`uy` scale metres east and north. Cuts are joined end to end
+ * before anything is drawn, because a dash pattern restarted in every cell
+ * reads as a dotted line rather than a walk. */
+function contour(F, level, cx, cy, ux, uy) {
+  const n = F.n, d = F.d;
+  const linkA = F.linkA, linkB = F.linkB, seen = F.seen, ex = F.ex, ey = F.ey;
+  linkA.fill(-1);
+  linkB.fill(-1);
+  seen.fill(0);
+
+  for (let iy = 0; iy < n; iy++) {
+    const row = iy * (n + 1);
+    for (let ix = 0; ix < n; ix++) {
+      const v0 = d[row + ix], v1 = d[row + ix + 1];
+      const v3 = d[row + n + 1 + ix], v2 = d[row + n + 2 + ix];
+      let code = 0;
+      if (v0 <= level) code |= 1;
+      if (v1 <= level) code |= 2;
+      if (v2 <= level) code |= 4;
+      if (v3 <= level) code |= 8;
+      const cuts = MS_CUTS[code];
+      for (let c = 0; c < cuts.length; c += 2) {
+        const p = edgeCut(F, cuts[c], ix, iy, v0, v1, v2, v3, level);
+        const q = edgeCut(F, cuts[c + 1], ix, iy, v0, v1, v2, v3, level);
+        if (linkA[p] < 0) linkA[p] = q; else linkB[p] = q;
+        if (linkA[q] < 0) linkA[q] = p; else linkB[q] = p;
+      }
+    }
+  }
+
+  const path = new Path2D();
+  const chain = F.chain;
+  // A canal is narrower than a grid cell at most budgets, so the field can
+  // show one as a sliver a cell or two across -- and a contour around that is
+  // a speck, not a shape. Anything smaller than a few cells is dropped, which
+  // is the honest reading: below the grid the drawing has nothing to say.
+  const least = 4 * F.step;
+  // Open chains first, from their loose end: those are the places the outline
+  // runs off the edge of the grid. Whatever is left over is a closed loop.
+  for (let pass = 0; pass < 2; pass++) {
+    for (let id = 0; id < linkA.length; id++) {
+      if (linkA[id] < 0 || seen[id]) continue;
+      if (pass === 0 && linkB[id] >= 0) continue;
+      let cur = id, prev = -1, len = 0;
+      let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+      for (;;) {
+        seen[cur] = 1;
+        chain[len++] = cur;
+        const x = ex[cur], y = ey[cur];
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+        let next = linkA[cur];
+        if (next === prev || next < 0) next = linkB[cur];
+        if (next < 0) break;
+        if (seen[next]) { chain[len++] = next; break; }  // the loop closed
+        prev = cur;
+        cur = next;
+      }
+      if (maxX - minX + maxY - minY < least) continue;
+      path.moveTo(cx + ex[chain[0]] * ux, cy - ey[chain[0]] * uy);
+      for (let k = 1; k < len; k++) {
+        path.lineTo(cx + ex[chain[k]] * ux, cy - ey[chain[k]] * uy);
+      }
+    }
+  }
+  return path;
 }
 
 /* ----------------------------------------------------------------- search */
@@ -369,12 +622,11 @@ function search(lon, lat, t0, horizon, accessSec) {
   // click anywhere away from water leaves nCand at zero and the rest of the
   // walk stays exactly the arithmetic it always was.
   const B = D.barriers;
-  let nCand = 0, exits = null, reach = null;
+  let nCand = 0, exits = null;
   if (B) {
     nCand = collectSegments(B, lon, lat, seedRadius, kx, ky);
     if (nCand) {
       exits = gateExits(B, nCand, lon, lat, seedRadius, kx, ky, SHORE_SLACK);
-      reach = reachProfile(B, nCand, B.reach, lon, lat, seedRadius, kx, ky);
     }
   }
 
@@ -487,28 +739,18 @@ function search(lon, lat, t0, horizon, accessSec) {
   const groups = D.gOrder.subarray(0, gCount);
   groups.sort((a, b) => gArr[a] - gArr[b]);
 
-  // The far side of every bridge the walk can pay for, with the metres it
-  // cost to get there, so the paint loop can draw the reach beyond it.
-  const lobes = [];
+  // What the walk can cover, bridges and all, as one field for the outline to
+  // be drawn from. Nothing here feeds the search -- it has already run -- so
+  // a click away from water pays for none of it.
+  let field = null;
   if (nCand) {
-    for (let k = 0; k < exits.length; k++) {
-      const e = exits[k];
-      if (seedRadius - e.cost < 60) continue;      // too little to be visible
-      const lPhi = e.lat * Math.PI / 180;
-      lobes.push({
-        cost: e.cost,
-        reach: reachProfile(B, nCand, new Float32Array(REACH_RAYS),
-                            e.lon, e.lat, seedRadius - e.cost, kx, ky),
-        mercX: (e.lon + 180) / 360,
-        mercY: 0.5 - Math.log(Math.tan(Math.PI / 4 + lPhi / 2)) / (2 * Math.PI),
-        mPerMerc: 1 / (EARTH_CIRC * Math.cos(lPhi)),
-      });
-    }
+    const nSrc = buildSources(B, nCand, exits, lon, lat, seedRadius, kx, ky);
+    field = walkField(B, nSrc, seedRadius);
   }
 
   return {
     reached, count, groups, gCount, longest, farthest, seeds, scanned, nearest,
-    blocked, reach, lobes,
+    blocked, field,
     t0, horizon, accessSec, lon, lat,
     mercX: (lon + 180) / 360,
     mercY: 0.5 - Math.log(Math.tan(Math.PI / 4 + phi / 2)) / (2 * Math.PI),
@@ -703,15 +945,7 @@ function paintNetwork({ kx, ky, ox, oy }) {
     vctx.strokeStyle = walkColor;
     vctx.lineWidth = 1.4 * dpr;
     vctx.setLineDash([5 * dpr, 5 * dpr]);
-    traceReach(current, current.reach, walked, kx, ky, ox, oy);
-    // and once more beyond each bridge the walk can afford, which is the
-    // part of the answer a single circle can never show
-    for (let k = 0; k < current.lobes.length; k++) {
-      const lobe = current.lobes[k];
-      if (walked > lobe.cost) {
-        traceReach(lobe, lobe.reach, walked - lobe.cost, kx, ky, ox, oy);
-      }
-    }
+    traceReach(current, walked, kx, ky, ox, oy);
     vctx.setLineDash([]);
   }
 
@@ -753,29 +987,21 @@ function paintNetwork({ kx, ky, ox, oy }) {
 }
 
 /* One dashed outline of how far the walk has got. With no barrier data in
- * range this is the circle it has always been; with barriers it is the same
- * circle sampled in REACH_RAYS directions and cut short wherever the bank
- * comes first, so the map stops claiming a shore it cannot cross. Mercator y
- * grows southward and so does the canvas, hence the negated sine. */
-function traceReach(centre, reach, walked, kx, ky, ox, oy) {
+ * range it is the circle it has always been; with barriers it is the walking
+ * field contoured at the metres walked, which is the same circle wherever
+ * nothing is in the way. Mercator y grows southward and so does the canvas,
+ * hence the negated northing. */
+function traceReach(centre, walked, kx, ky, ox, oy) {
   const cx = (centre.mercX * kx + ox) * dpr;
   const cy = (centre.mercY * ky + oy) * dpr;
-  vctx.beginPath();
-  if (!reach) {
-    vctx.arc(cx, cy, walked * centre.mPerMerc * kx * dpr, 0, TAU);
+  const unit = centre.mPerMerc * dpr;
+  if (!centre.field) {
+    vctx.beginPath();
+    vctx.arc(cx, cy, walked * unit * kx, 0, TAU);
     vctx.stroke();
     return;
   }
-  const unit = centre.mPerMerc * dpr;
-  for (let r = 0; r < REACH_RAYS; r++) {
-    const angle = r * TAU / REACH_RAYS;
-    const d = Math.min(walked, reach[r]);
-    const x = cx + Math.cos(angle) * d * unit * kx;
-    const y = cy - Math.sin(angle) * d * unit * ky;
-    if (r === 0) vctx.moveTo(x, y); else vctx.lineTo(x, y);
-  }
-  vctx.closePath();
-  vctx.stroke();
+  vctx.stroke(contour(centre.field, walked, cx, cy, unit * kx, unit * ky));
 }
 
 /* The old rendering, kept behind a checkbox: how far you could walk from
@@ -1244,5 +1470,6 @@ if (typeof document !== 'undefined') {
   module.exports = {
     D, ingest, search, WALK_MPS, MIN_CHANGE, SHORE_SLACK,
     segHit, crosses, collectSegments, gateExits, walkDistance, buildBarriers,
+    buildSources, walkField, fieldValue, contour, FIELD_CELLS,
   };
 }
