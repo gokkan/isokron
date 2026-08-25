@@ -1,9 +1,15 @@
 name: Refresh water geometry
 
-# Manual only, and deliberately so. The weekly build must never depend on
-# Overpass being up: it reads prep/barriers.geojson from the repository, the
-# same way it reads the fixture. This job is how that file gets replaced --
-# rarely, when a bridge opens or the region grows.
+# Never on a schedule and never on an ordinary push. The weekly build must
+# not depend on Overpass being up: it reads prep/barriers.geojson out of the
+# repository, the same way it reads the fixture. This job is how that file
+# gets replaced -- rarely, when a bridge opens or the region grows.
+#
+# Two ways in, because workflow_dispatch only works once the file sits on the
+# default branch, and the very first run has to happen before that:
+#
+#   from Actions, on main:   the Run workflow button
+#   from anywhere, any time: git tag barriers-run-1 && git push origin barriers-run-1
 on:
   workflow_dispatch:
     inputs:
@@ -16,16 +22,31 @@ on:
       endpoint:
         description: "Overpass endpoint"
         default: "https://overpass-api.de/api/interpreter"
+  push:
+    tags: ["barriers-run-*"]
 
+# Only contents. The result is pushed to a branch rather than opened as a
+# pull request, so the job does not need the org-level permission to let
+# Actions create pull requests -- and the branch is one click from a PR.
 permissions:
   contents: write
-  pull-requests: write
+
+env:
+  BBOX: ${{ inputs.bbox || '57.20,11.00,59.35,14.80' }}
+  TOLERANCE: ${{ inputs.tolerance || '0.0004' }}
+  ENDPOINT: ${{ inputs.endpoint || 'https://overpass-api.de/api/interpreter' }}
+  RESULT_BRANCH: barriers/refresh
 
 jobs:
   fetch:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # A tag push checks out a detached HEAD, and the summary below has
+          # to work out which branch that commit belongs to so the pull
+          # request link has somewhere to aim.
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -38,12 +59,32 @@ jobs:
       - name: Install Python deps
         run: pip install -r prep/requirements.txt
 
+      # Over a hundred Overpass requests go into one full-region run, and the
+      # fair-use limiter will interrupt somewhere in the middle of that. Every
+      # response is cached by query, so a re-run resumes instead of starting
+      # over. Restore and save are split, and the save runs even when the
+      # fetch failed -- a cache that only survives success would be no use
+      # for exactly the case it exists for.
+      - name: Restore cached Overpass responses
+        uses: actions/cache/restore@v4
+        with:
+          path: tmp/overpass
+          key: overpass-${{ env.BBOX }}-${{ github.run_id }}
+          restore-keys: overpass-${{ env.BBOX }}-
+
       - name: Fetch from OpenStreetMap
+        id: fetch
         run: |
           python prep/fetch_barriers.py --out prep/barriers.geojson \
-            --bbox "${{ inputs.bbox }}" \
-            --tolerance "${{ inputs.tolerance }}" \
-            --endpoint "${{ inputs.endpoint }}"
+            --bbox "$BBOX" --tolerance "$TOLERANCE" --endpoint "$ENDPOINT" \
+            --cache tmp/overpass
+
+      - name: Save cached Overpass responses
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: tmp/overpass
+          key: overpass-${{ env.BBOX }}-${{ github.run_id }}
 
       # The new geometry has to survive the whole pipeline before anyone is
       # asked to look at it: prep must pack it, and both search
@@ -61,19 +102,39 @@ jobs:
             --expect Partille --forbid Kungälv
           node tests/client.test.mjs tmp/fixture-data tmp/dump.json
 
-      # A pull request rather than a push: this file decides what the map
-      # claims about the world, and a diff of it is worth a pair of eyes.
-      - uses: peter-evans/create-pull-request@v6
-        with:
-          branch: barriers/refresh
-          title: "Uppdatera vattengeometrin från OpenStreetMap"
-          commit-message: "Uppdatera vattengeometrin från OpenStreetMap"
-          body: |
-            Hämtad med `prep/fetch_barriers.py` inom
-            `${{ inputs.bbox }}`, förenklad med tolerans
-            `${{ inputs.tolerance }}`.
+      # A branch rather than a commit onto whatever ran this: the file decides
+      # what the map claims about the world, and a diff of it is worth a pair
+      # of eyes. Branched off the commit that was checked out, so a pull
+      # request back into that shows one file and nothing else.
+      - name: Push the result to a branch
+        run: |
+          if git diff --quiet -- prep/barriers.geojson; then
+            echo "Geometrin är oförändrad — inget att granska." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$RESULT_BRANCH"
+          git add prep/barriers.geojson
+          git commit -m "Uppdatera vattengeometrin från OpenStreetMap
 
-            Geometrin är härledd ur OpenStreetMap och står under ODbL.
-            Titta på diffen i en kartvisare innan den går in — den avgör
-            vilka hållplatser kartan påstår att man kan gå till.
-          add-paths: prep/barriers.geojson
+          Hämtad inom $BBOX, förenklad med tolerans $TOLERANCE.
+          Härledd ur OpenStreetMap, ODbL."
+          git push --force origin "$RESULT_BRANCH"
+          # A tag is not something a pull request can aim at, so find the
+          # branch the tagged commit sits on and use that.
+          base=$(git branch -r --contains "$GITHUB_SHA" \
+                   --format='%(refname:lstrip=3)' \
+                 | grep -vx 'HEAD' | grep -vx "$RESULT_BRANCH" | head -1)
+          base=${base:-${{ github.event.repository.default_branch }}}
+          {
+            echo "### Vattengeometrin är hämtad"
+            echo
+            echo "Ligger på \`$RESULT_BRANCH\`, hämtad inom \`$BBOX\`."
+            echo
+            echo "Öppna en pull request mot \`$base\`:"
+            echo "<${{ github.server_url }}/${{ github.repository }}/compare/${base}...${RESULT_BRANCH}?expand=1>"
+            echo
+            echo "Titta på diffen i en kartvisare innan den går in — den"
+            echo "avgör vilka hållplatser kartan påstår att man kan gå till."
+          } >> "$GITHUB_STEP_SUMMARY"

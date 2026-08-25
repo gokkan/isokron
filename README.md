@@ -94,6 +94,51 @@ komprimera `application/octet-stream`.
   hade en källfil att packa; saknas den går gången fågelvägen som förut.
 - `trips.json`, `connections.json`, `footpaths.json`, `meta.json`.
 
+## Vattengeometrin
+
+`prep/barriers.geojson` är committad och byggs inte om automatiskt — den
+ändras när en bro öppnar, inte när tidtabellen gör det. Hämta den så här:
+
+```powershell
+python prep/fetch_barriers.py --out prep/barriers.geojson
+```
+
+En full regionkörning är över hundra Overpass-anrop, och fair-use-gränsen
+avbryter någonstans i mitten av det. Därför cachar skriptet varje svar per
+fråga under `tmp/overpass`, så en avbruten körning återupptas i stället för
+att börja om. Prova gärna en mindre ruta först — kedjan är densamma:
+
+```powershell
+python prep/fetch_barriers.py --out tmp/gbg.geojson --bbox 57.60,11.75,57.85,12.15
+```
+
+Tre saker skriptet gör som är värda att veta om:
+
+- **Rutor som Overpass säger nej till fyrdelas** och frågas om igen, i stället
+  för att göras om oförändrade. Skärgården behöver ett finare rutnät än
+  Dalsland, och det behöver ingen bestämma i förväg.
+- **En 200 kan vara ett fel.** En fråga som dör inne i Overpass kommer
+  tillbaka som HTTP 200 med en `remark`. Att ta den för god skulle tyst tappa
+  en rutas vatten, vilket är värre än att krascha, så den läses.
+- **Bara broar som faktiskt korsar vatten vi behållit sparas.** Annars följer
+  varje viadukt över en väg och varje planka över ett dike med, vilket både
+  sväller filen och gör varje blockerad gång långsammare — omvägssökningen
+  provar en bro i taget.
+
+I Actions kör `.github/workflows/barriers.yml` samma sak, med Overpass-cachen
+i `actions/cache` så att en omkörning fortsätter där den strök. Den startas
+antingen från Actions-fliken (`workflow_dispatch`, kräver att filen redan
+ligger på default-branchen) eller med en tagg, vilket fungerar från vilken
+gren som helst och därför är vägen in första gången:
+
+```powershell
+git tag barriers-run-1 && git push origin barriers-run-1
+```
+
+Resultatet hamnar på grenen `barriers/refresh`, grenad ur den commit som
+kördes, så en pull request tillbaka visar exakt en fil. Jobbet skriver en
+länk för att öppna den i sin sammanfattning.
+
 ## Avsteg från ursprungsplanen
 
 Fem, alla medvetna:
@@ -177,8 +222,7 @@ Fem, alla medvetna:
    vatten som spelar roll.
 
    Veckobygget hämtar ingenting nytt. `prep/fetch_barriers.py` körs för hand
-   eller via `workflow_dispatch` (`.github/workflows/barriers.yml`), och
-   resultatet granskas som en pull request innan det committas. Saknas filen
+   eller i Actions, och resultatet granskas innan det committas. Saknas filen
    faller allt tillbaka på fågelvägen, exakt som förut — och det är den vägen
    ett bygge utan geometri går.
 
