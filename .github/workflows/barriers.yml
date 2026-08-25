@@ -59,18 +59,18 @@ jobs:
       - name: Install Python deps
         run: pip install -r prep/requirements.txt
 
-      # A cache key may not contain a comma, and a bounding box is nothing
-      # but commas. Name the cache after the box with the commas swapped out,
-      # so each region still keeps its own cache.
-      - name: Name the cache after the bounding box
-        run: echo "BBOX_KEY=${BBOX//,/_}" >> "$GITHUB_ENV"
-
       # Over a hundred Overpass requests go into one full-region run, and the
       # fair-use limiter will interrupt somewhere in the middle of that. Every
       # response is cached by query, so a re-run resumes instead of starting
       # over. Restore and save are split, and the save runs even when the
       # fetch failed -- a cache that only survives success would be no use
       # for exactly the case it exists for.
+      #
+      # One cache for every bounding box, not one per box. Keying it by the
+      # box looks tidier and is wrong: narrowing the region after a failed
+      # run would then throw away every tile the failed run had already
+      # fetched, which is the moment the cache is worth the most. What is
+      # inside is keyed by query, so boxes that overlap simply share.
       #
       # Neither may sink the run. The cache is an optimisation; the fetch
       # works without it, just slower, and a job that refuses to start
@@ -80,8 +80,8 @@ jobs:
         continue-on-error: true
         with:
           path: tmp/overpass
-          key: overpass-${{ env.BBOX_KEY }}-${{ github.run_id }}
-          restore-keys: overpass-${{ env.BBOX_KEY }}-
+          key: overpass-v1-${{ github.run_id }}
+          restore-keys: overpass-v1-
 
       - name: Fetch from OpenStreetMap
         id: fetch
@@ -96,7 +96,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: tmp/overpass
-          key: overpass-${{ env.BBOX_KEY }}-${{ github.run_id }}
+          key: overpass-v1-${{ github.run_id }}
 
       # The new geometry has to survive the whole pipeline before anyone is
       # asked to look at it: prep must pack it, and both search
