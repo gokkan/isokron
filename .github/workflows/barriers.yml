@@ -15,7 +15,13 @@ on:
     inputs:
       bbox:
         description: "south,west,north,east"
-        default: "57.20,11.00,59.35,14.80"
+        # The Gota alv corridor, which is where the crow flies over water
+        # that people actually stand beside. The whole region is a valid
+        # value and was tried: it takes over a hundred Overpass requests and
+        # lost the host twice before finishing. Widen deliberately, in steps,
+        # not by default -- and the cache is shared across boxes, so a wider
+        # run keeps everything a narrower one already fetched.
+        default: "57.60,11.75,57.85,12.15"
       tolerance:
         description: "Douglas-Peucker tolerance in degrees (0.0004 ≈ 40 m)"
         default: "0.0004"
@@ -32,7 +38,7 @@ permissions:
   contents: write
 
 env:
-  BBOX: ${{ inputs.bbox || '57.20,11.00,59.35,14.80' }}
+  BBOX: ${{ inputs.bbox || '57.60,11.75,57.85,12.15' }}
   TOLERANCE: ${{ inputs.tolerance || '0.0004' }}
   ENDPOINT: ${{ inputs.endpoint || 'https://overpass-api.de/api/interpreter' }}
   RESULT_BRANCH: barriers/refresh
@@ -65,12 +71,29 @@ jobs:
       # over. Restore and save are split, and the save runs even when the
       # fetch failed -- a cache that only survives success would be no use
       # for exactly the case it exists for.
+      #
+      # One cache for every bounding box, not one per box. Keying it by the
+      # box looks tidier and is wrong: narrowing the region after a failed
+      # run would then throw away every tile the failed run had already
+      # fetched, which is the moment the cache is worth the most. What is
+      # inside is keyed by query, so boxes that overlap simply share.
+      #
+      # Neither may sink the run. The cache is an optimisation; the fetch
+      # works without it, just slower, and a job that refuses to start
+      # because a cache misbehaved is worse than one that re-asks Overpass.
       - name: Restore cached Overpass responses
         uses: actions/cache/restore@v4
+        continue-on-error: true
         with:
           path: tmp/overpass
-          key: overpass-${{ env.BBOX }}-${{ github.run_id }}
-          restore-keys: overpass-${{ env.BBOX }}-
+          key: overpass-v1-${{ github.run_id }}
+          # The second line is a bridge from the older, per-box naming, so
+          # the tiles the first full-region attempt managed to fetch before
+          # it lost the host are not thrown away. Removable once a v1 cache
+          # exists.
+          restore-keys: |
+            overpass-v1-
+            overpass-57.20_11.00_59.35_14.80-
 
       - name: Fetch from OpenStreetMap
         id: fetch
@@ -81,10 +104,11 @@ jobs:
 
       - name: Save cached Overpass responses
         if: always()
+        continue-on-error: true
         uses: actions/cache/save@v4
         with:
           path: tmp/overpass
-          key: overpass-${{ env.BBOX }}-${{ github.run_id }}
+          key: overpass-v1-${{ github.run_id }}
 
       # The new geometry has to survive the whole pipeline before anyone is
       # asked to look at it: prep must pack it, and both search
@@ -102,20 +126,34 @@ jobs:
             --expect Partille --forbid Kungälv
           node tests/client.test.mjs tmp/fixture-data tmp/dump.json
 
+          # And once against the geometry this run actually fetched. The
+          # check above proves the code still works; only this one proves the
+          # file being proposed parses, clips and packs -- which is a
+          # different claim, and the one that matters here.
+          python prep/prep.py --zip tmp/fixture.zip --out tmp/realgeo-data \
+            --barriers prep/barriers.geojson
+          python prep/verify.py --data tmp/realgeo-data --stop Brunnsparken \
+            --time 08:00 --horizon 30 --top 0
+          ls -l tmp/realgeo-data/barriers.bin
+
       # A branch rather than a commit onto whatever ran this: the file decides
       # what the map claims about the world, and a diff of it is worth a pair
       # of eyes. Branched off the commit that was checked out, so a pull
       # request back into that shows one file and nothing else.
       - name: Push the result to a branch
         run: |
-          if git diff --quiet -- prep/barriers.geojson; then
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Stage first, then ask the index. git diff does not see an
+          # untracked file, so asking it about a file that did not exist
+          # before answers "unchanged" -- and the job passes having produced
+          # nothing at all, which is the worst way for this to fail.
+          git add prep/barriers.geojson
+          if git diff --cached --quiet -- prep/barriers.geojson; then
             echo "Geometrin är oförändrad — inget att granska." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -b "$RESULT_BRANCH"
-          git add prep/barriers.geojson
           git commit -m "Uppdatera vattengeometrin från OpenStreetMap
 
           Hämtad inom $BBOX, förenklad med tolerans $TOLERANCE.

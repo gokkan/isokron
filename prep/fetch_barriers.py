@@ -36,6 +36,7 @@ import hashlib
 import json
 import math
 import os
+import socket
 import sys
 import time
 import urllib.error
@@ -88,12 +89,33 @@ def cache_path(cache_dir, query):
     return os.path.join(cache_dir, digest + ".json.gz")
 
 
-def overpass(query, cache_dir, retries=5, timeout=600):
+def force_ipv4():
+    """Resolve the endpoint over IPv4 only.
+
+    A full-region run died on 'Network is unreachable' after nearly two hours
+    of working fine. That is a routing failure, not a refusal -- the runner
+    has AAAA records to try and no route for them. Asking for A records only
+    takes the failure mode away.
+    """
+    original = socket.getaddrinfo
+
+    def ipv4_only(host, port, family=0, *args, **kwargs):
+        return original(host, port, socket.AF_INET, *args, **kwargs)
+
+    socket.getaddrinfo = ipv4_only
+
+
+def overpass(query, cache_dir, retries=10, timeout=600):
     """One Overpass request, cached on disk and patient about being throttled.
 
     Raises QueryTooBig when the server says the query timed out or ran out of
     memory -- that is not a transient failure and retrying it unchanged only
     burns quota.
+
+    Ten attempts and waits up to five minutes, not three and thirty seconds:
+    a Goteborg-sized run drew two 429s inside its first three queries, and a
+    full region eventually lost the host entirely. Waiting is cheaper than a
+    re-run, and the cache means a re-run costs only what is still missing.
     """
     path = cache_path(cache_dir, query) if cache_dir else None
     if path and os.path.exists(path):
@@ -147,7 +169,7 @@ def overpass(query, cache_dir, retries=5, timeout=600):
         pause = wait if wait else delay
         log("    %s -- waiting %ds" % (last, pause))
         time.sleep(pause)
-        delay = min(delay * 2, 120)
+        delay = min(delay * 2, 300)
     raise RuntimeError("overpass failed after %d attempts: %s" % (retries, last))
 
 
@@ -365,9 +387,13 @@ def main():
     ap.add_argument("--keep-dry-bridges", action="store_true",
                     help="keep bridges that cross no water we shipped")
     ap.add_argument("--endpoint", default=ENDPOINT)
+    ap.add_argument("--ipv6", action="store_true",
+                    help="allow IPv6; off by default, see force_ipv4")
     args = ap.parse_args()
 
     ENDPOINT = args.endpoint
+    if not args.ipv6:
+        force_ipv4()
     bbox = tuple(float(v) for v in args.bbox.split(","))
     cache_dir = None if args.no_cache else args.cache
     if cache_dir:
@@ -389,6 +415,13 @@ def main():
     kept_points = sum(len(l) for l in lines)
     log("simplifying and filtering...")
     log("  %d lines, %d -> %d points" % (len(lines), raw_points, kept_points))
+
+    # Overpass can answer politely and say nothing. Writing that out would
+    # produce a valid, empty file that silently turns the water check off
+    # again, so refuse rather than hand back a plausible-looking nothing.
+    if not lines:
+        raise SystemExit("no barriers found in %s -- refusing to write an "
+                         "empty file" % args.bbox)
 
     before = len(gates)
     if not args.keep_dry_bridges:
