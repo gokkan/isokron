@@ -126,6 +126,16 @@ jobs:
             --expect Partille --forbid Kungälv
           node tests/client.test.mjs tmp/fixture-data tmp/dump.json
 
+          # And once against the geometry this run actually fetched. The
+          # check above proves the code still works; only this one proves the
+          # file being proposed parses, clips and packs -- which is a
+          # different claim, and the one that matters here.
+          python prep/prep.py --zip tmp/fixture.zip --out tmp/realgeo-data \
+            --barriers prep/barriers.geojson
+          python prep/verify.py --data tmp/realgeo-data --stop Brunnsparken \
+            --time 08:00 --horizon 30 --top 0
+          ls -l tmp/realgeo-data/barriers.bin
+
       # A branch rather than a commit onto whatever ran this: the file decides
       # what the map claims about the world, and a diff of it is worth a pair
       # of eyes. Branched off the commit that was checked out, so a pull

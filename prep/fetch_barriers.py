@@ -416,6 +416,13 @@ def main():
     log("simplifying and filtering...")
     log("  %d lines, %d -> %d points" % (len(lines), raw_points, kept_points))
 
+    # Overpass can answer politely and say nothing. Writing that out would
+    # produce a valid, empty file that silently turns the water check off
+    # again, so refuse rather than hand back a plausible-looking nothing.
+    if not lines:
+        raise SystemExit("no barriers found in %s -- refusing to write an "
+                         "empty file" % args.bbox)
+
     before = len(gates)
     if not args.keep_dry_bridges:
         gates = gates_over_water(gates, lines, bbox)
