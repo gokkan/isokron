@@ -81,7 +81,13 @@ jobs:
         with:
           path: tmp/overpass
           key: overpass-v1-${{ github.run_id }}
-          restore-keys: overpass-v1-
+          # The second line is a bridge from the older, per-box naming, so
+          # the tiles the first full-region attempt managed to fetch before
+          # it lost the host are not thrown away. Removable once a v1 cache
+          # exists.
+          restore-keys: |
+            overpass-v1-
+            overpass-57.20_11.00_59.35_14.80-
 
       - name: Fetch from OpenStreetMap
         id: fetch
