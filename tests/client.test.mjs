@@ -6,7 +6,7 @@
  * it can run on a click, once in prep/verify.py so prep output can be checked
  * without a browser. This asserts the two still agree, stop for stop.
  */
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -26,6 +26,8 @@ const bin = (name) => {
   return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength);
 };
 
+const hasBarriers = existsSync(join(dataDir, 'barriers.json'));
+
 app.ingest({
   meta: json('meta.json'),
   stops: json('stops.json'),
@@ -34,6 +36,8 @@ app.ingest({
   connBuf: bin('connections.bin'),
   fpHeader: json('footpaths.json'),
   fpBuf: bin('footpaths.bin'),
+  barrierHeader: hasBarriers ? json('barriers.json') : null,
+  barrierBuf: hasBarriers ? bin('barriers.bin') : null,
 });
 
 let failures = 0;
@@ -99,6 +103,15 @@ if (dumpFile) {
   check('same number of stops reached',
         mine.size === ref.stop.length,
         `js ${mine.size} vs py ${ref.stop.length}`);
+  // Seeding is where the water check lives, so compare it directly: a
+  // divergence then fails here instead of surfacing three transfers later
+  // as an arrival-time delta nobody can trace back.
+  if (ref.seeds !== undefined) {
+    check('same stops seeded on foot', got.seeds === ref.seeds,
+          `js ${got.seeds} vs py ${ref.seeds}`);
+    check('same stops rejected for water', got.blocked === ref.blocked,
+          `js ${got.blocked} vs py ${ref.blocked}`);
+  }
 
   let worst = 0, missing = 0;
   for (let k = 0; k < ref.stop.length; k++) {
@@ -121,10 +134,76 @@ if (dumpFile) {
   console.log(`  note  ${modeMismatch} of ${ref.stop.length} stops differ in `
               + 'dominant mode (last-leg vs longest-leg labelling)');
 
+  // The dashed outline is sampled from the same geometry the search used, so
+  // a map that draws a circle straight over the water while refusing to seed
+  // anything on the far side is a contradiction worth catching here.
+  if (got.blocked > 0) {
+    const budget = Math.min(ref.horizon, ref.access) * app.WALK_MPS;
+    check('the drawn outline is cut where the walk was blocked',
+          !!got.reach && Math.min(...got.reach) < budget - 1,
+          got.reach ? `shortest ray ${Math.min(...got.reach).toFixed(0)} m of `
+                      + `${budget.toFixed(0)} m` : 'no outline sampled');
+  }
+
   const t = process.hrtime.bigint();
   app.search(ref.lon, ref.lat, ref.t0, ref.horizon, ref.access);
   const ms = Number(process.hrtime.bigint() - t) / 1e6;
   check('search under 100 ms', ms < 100, `${ms.toFixed(1)} ms`);
+}
+
+if (hasBarriers) {
+  const B = D.barriers;
+  const head = json('barriers.json');
+  console.log('\nbarrier data');
+  const off = new Uint32Array(
+    bin('barriers.bin'),
+    head.arrays.find((a) => a.name === 'offsets').offset,
+    head.arrays.find((a) => a.name === 'offsets').length);
+  check('offsets start at zero and rise', (() => {
+    if (off[0] !== 0) return false;
+    for (let i = 1; i < off.length; i++) if (off[i] <= off[i - 1]) return false;
+    return off[off.length - 1] === B.lon.length;
+  })(), `${off.length - 1} lines over ${B.lon.length} points`);
+  check('every polyline has at least two points', (() => {
+    for (let i = 1; i < off.length; i++) if (off[i] - off[i - 1] < 2) return false;
+    return true;
+  })());
+  check('every coordinate is finite', (() => {
+    for (let i = 0; i < B.lon.length; i++) {
+      if (!Number.isFinite(B.lon[i]) || !Number.isFinite(B.lat[i])) return false;
+    }
+    return true;
+  })());
+  check('every bridge has a positive length', (() => {
+    for (let i = 0; i < B.nGates; i++) if (!(B.gateLen[i] > 0)) return false;
+    return true;
+  })(), `${B.nGates} bridges`);
+}
+
+// The two deliberate decisions in the geometry, asserted so that a later
+// reader cannot quietly "fix" either of them.
+console.log('\ncrossing rules');
+{
+  const line = (ax, ay, bx, by) => ({
+    lon: Float32Array.from([ax, bx]), lat: Float32Array.from([ay, by]),
+    offsets: Uint32Array.from([0, 2]),
+    gate_a_lon: new Float32Array(0), gate_a_lat: new Float32Array(0),
+    gate_b_lon: new Float32Array(0), gate_b_lat: new Float32Array(0),
+    gate_len: new Float32Array(0),
+  });
+  const B = app.buildBarriers({}, line(0, 0, 10, 0));
+  const kx = 1, ky = 1;
+  const hit = (ax, ay, bx, by, slack = 0) => {
+    const n = app.collectSegments(B, (ax + bx) / 2, (ay + by) / 2, 1e6, kx, ky);
+    return app.crosses(B, n, ax, ay, bx, by, kx, ky, slack);
+  };
+  check('a line straight across is blocked', hit(5, -1, 5, 1));
+  check('a line alongside is not', hit(1, 1, 9, 1) === false);
+  check('touching an end is not a crossing', hit(5, -1, 5, 0) === false);
+  check('slack forgives a crossing next to an end',
+        hit(5, -0.5, 5, 0.4, 0.5) === false);
+  check('slack does not forgive one in the middle',
+        hit(5, -3, 5, 3, 0.5) === true);
 }
 
 console.log(failures ? `\n${failures} failure(s)` : '\nall checks passed');

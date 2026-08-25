@@ -49,13 +49,57 @@ jobs:
       - name: Self-test on the fixture
         run: |
           mkdir -p tmp
-          python tools/make_fixture.py --out tmp/fixture.zip
-          python prep/prep.py --zip tmp/fixture.zip --out tmp/fixture-data
+          python tools/make_fixture.py --out tmp/fixture.zip \
+            --barriers tmp/fixture-barriers.geojson
+          python prep/prep.py --zip tmp/fixture.zip --out tmp/fixture-data \
+            --barriers tmp/fixture-barriers.geojson
           python prep/verify.py --data tmp/fixture-data --stop Brunnsparken \
             --time 08:00 --horizon 30 --top 0 --dump tmp/dump.json \
             --expect Angered --expect Frölunda --expect Mölndal \
             --expect Partille --forbid Kungälv
           node tests/client.test.mjs tmp/fixture-data tmp/dump.json
+
+      # The fixture carries a synthetic river with one bridge across it, and
+      # a tram line on the far bank that connects to nothing else -- so those
+      # stops appear if and only if the walk can reach them. Three claims:
+      # the water blocks, dropping the check restores the old answer, and the
+      # bridge opens the crossing. The second dump cross-checks the browser
+      # against the reference with stops actually being rejected, which the
+      # Brunnsparken dump never exercises.
+      - name: The water check does what it says
+        run: |
+          python prep/verify.py --data tmp/fixture-data --at 57.7105,11.9380 \
+            --time 08:00 --horizon 30 --top 0 --forbid Lindholmen \
+            --min-blocked 2 --dump tmp/water-dump.json
+          python prep/verify.py --data tmp/fixture-data --at 57.7105,11.9380 \
+            --time 08:00 --horizon 30 --top 0 --no-barriers \
+            --expect Lindholmen
+          python prep/verify.py --data tmp/fixture-data --at 57.7105,11.9660 \
+            --time 08:00 --horizon 30 --top 0 --expect Frihamnen
+          node tests/client.test.mjs tmp/fixture-data tmp/water-dump.json
+
+      # The same check on the transfer walks, which live in the data rather
+      # than in the search -- so this needs a second build to compare against.
+      # Kanaltorget and Frihamnen face each other across the river 389 m
+      # apart, inside the 400 m radius; the origin is placed so that neither
+      # is within walking distance and Kanaltorget is only ever arrived at by
+      # bus, because footpaths are relaxed on arrival and not from a seed.
+      # The crow build doubles as proof that a build without geometry still
+      # behaves exactly as it did before there was any.
+      - name: Transfer walks do not cross the river either
+        run: |
+          python prep/prep.py --zip tmp/fixture.zip --out tmp/fixture-crow \
+            --no-barriers
+          python prep/verify.py --data tmp/fixture-crow --at 57.7080,11.9790 \
+            --time 08:00 --horizon 30 --access 5 --top 0 --expect Frihamnen
+          python prep/verify.py --data tmp/fixture-data --at 57.7080,11.9790 \
+            --time 08:00 --horizon 30 --access 5 --top 0 --forbid Frihamnen \
+            --expect Kanaltorget
+          python prep/verify.py --data tmp/fixture-crow --stop Brunnsparken \
+            --time 08:00 --horizon 30 --top 0 --dump tmp/crow-dump.json \
+            --expect Angered --expect Frölunda --expect Mölndal \
+            --expect Partille --forbid Kungälv
+          node tests/client.test.mjs tmp/fixture-crow tmp/crow-dump.json
 
       # The feed only changes once a day and the timetable we publish is
       # weekly, so one download per calendar week is enough. A Bronze key
@@ -106,6 +150,18 @@ jobs:
             --top 10 --expect Kungälv --expect Kungsbacka --expect Alingsås \
             --dump tmp/real-dump.json
           node tests/client.test.mjs public/data tmp/real-dump.json
+
+      # Södra Älvstranden, ten minutes' walk. Asserted by count rather than by
+      # stop name: names churn between feed versions, and the claim being made
+      # is only that Göta älv is in the way of something. Lindholmen is
+      # deliberately not forbidden -- it genuinely is reachable from here, by
+      # älvsnabben, which is a departure in the timetable and not a walk.
+      - name: Göta älv blocks the walk in the real feed
+        if: hashFiles('prep/barriers.geojson') != ''
+        run: |
+          python prep/verify.py --at 57.7040,11.9520 --time 08:00 \
+            --horizon 30 --top 0 --min-blocked 4 --dump tmp/alv-dump.json
+          node tests/client.test.mjs public/data tmp/alv-dump.json
 
       # The key only ever exists as an env var in the fetch step. Check that
       # nothing carrying it -- the archive, a request URL -- has drifted into

@@ -14,9 +14,14 @@ import argparse
 import json
 import math
 import os
+import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import numpy as np
+
+import barriers as water
 
 EARTH_R = 6371008.8
 INF = 1 << 30
@@ -39,21 +44,32 @@ def load(dirname):
 
     conn_h = js("connections.json")
     fp_h = js("footpaths.json")
-    return {
+    data = {
         "meta": js("meta.json"),
         "stops": js("stops.json"),
         "trips": js("trips.json"),
         "conn_header": conn_h,
         "conn": blob("connections.bin", conn_h),
         "fp": blob("footpaths.bin", fp_h),
+        "barriers": None,
     }
+    # An absent barrier file is not an error: the search then runs as the crow
+    # flies, exactly as it did before there was one.
+    if os.path.exists(os.path.join(dirname, "barriers.json")):
+        bar_h = js("barriers.json")
+        b = blob("barriers.bin", bar_h)
+        data["barriers"] = water.Barriers(
+            b["lon"], b["lat"], b["offsets"],
+            b["gate_a_lon"], b["gate_a_lat"],
+            b["gate_b_lon"], b["gate_b_lat"], b["gate_len"])
+    return data
 
 
 ACCESS_DEFAULT_S = 600   # assumed walk from the click point to a first stop
 
 
 def search(data, lat, lon, t0, horizon, origin_radius=None,
-           walk_mps=1.3888889, min_change=60):
+           walk_mps=1.3888889, min_change=60, use_barriers=True):
     """Trip-aware connection scan. Returns (arrival seconds, mode index)."""
     stops = data["stops"]
     n = stops["count"]
@@ -62,6 +78,8 @@ def search(data, lat, lon, t0, horizon, origin_radius=None,
     trips = data["trips"]
     trip_route = trips["trip_route"]
     route_cat = trips["routes"]["category"]
+
+    barriers = data["barriers"] if use_barriers else None
 
     arr = np.full(n, INF, dtype=np.int64)
     mode = np.full(n, -1, dtype=np.int8)
@@ -73,14 +91,32 @@ def search(data, lat, lon, t0, horizon, origin_radius=None,
     lat_r = math.radians(lat)
     kx = EARTH_R * math.cos(lat_r) * math.pi / 180.0
     ky = EARTH_R * math.pi / 180.0
-    seeds = 0
-    for i in range(n):
-        dx = (stops["lon"][i] - lon) * kx
-        dy = (stops["lat"][i] - lat) * ky
-        d = math.hypot(dx, dy)
-        if d <= origin_radius:
-            arr[i] = t0 + int(math.ceil(d / walk_mps))
-            seeds += 1
+
+    def seed(bars):
+        """Fill arr from the origin. Returns (seeds, blocked by water)."""
+        arr.fill(INF)
+        exits = bars.exits(lon, lat, origin_radius, kx, ky) if bars else None
+        found = blocked = 0
+        for i in range(n):
+            dx = (stops["lon"][i] - lon) * kx
+            dy = (stops["lat"][i] - lat) * ky
+            if math.hypot(dx, dy) > origin_radius:
+                continue
+            w = water.walk_distance(bars, lon, lat, stops["lon"][i],
+                                    stops["lat"][i], origin_radius, kx, ky,
+                                    exits)
+            if w is None:
+                blocked += 1
+                continue
+            arr[i] = t0 + int(math.ceil(w / walk_mps))
+            found += 1
+        return found, blocked
+
+    # No falling back when every nearby stop turns out to be across the
+    # water. That is not a failure to answer, it is the answer: click on the
+    # wrong quay and the stop you can see is genuinely an hour away. The
+    # panel says which, rather than quietly reverting to the crow.
+    seeds, blocked = seed(barriers)
 
     limit = t0 + horizon
     c_from, c_to = conn["from"], conn["to"]
@@ -113,7 +149,7 @@ def search(data, lat, lon, t0, horizon, origin_radius=None,
             if t < arr[tgt]:
                 arr[tgt] = t
                 mode[tgt] = mode[dst]
-    return arr, mode, seeds, scanned
+    return arr, mode, seeds, scanned, blocked
 
 
 def main():
@@ -132,6 +168,11 @@ def main():
                     help="substring that must appear among reached stops")
     ap.add_argument("--forbid", action="append", default=[],
                     help="substring that must not appear")
+    ap.add_argument("--no-barriers", action="store_true",
+                    help="ignore the water check, as it was before it existed")
+    ap.add_argument("--min-blocked", type=int, default=0,
+                    help="fail unless at least this many stops were rejected "
+                         "for having water in the way")
     args = ap.parse_args()
 
     data = load(args.data)
@@ -163,9 +204,10 @@ def main():
 
     access = args.access * 60
     began = time.time()
-    arr, mode, seeds, scanned = search(data, lat, lon, t0, horizon,
-                                       origin_radius=min(horizon, access)
-                                       * 1.3888889)
+    arr, mode, seeds, scanned, blocked = search(
+        data, lat, lon, t0, horizon,
+        origin_radius=min(horizon, access) * 1.3888889,
+        use_barriers=not args.no_barriers)
     elapsed = (time.time() - began) * 1000
 
     limit = t0 + horizon
@@ -181,6 +223,12 @@ def main():
           "connections in %.0f ms"
           % (seeds, min(horizon, access) * 1.3888889, args.access, scanned,
              elapsed))
+    if data["barriers"] is None:
+        print("  no barrier data: walking is as the crow flies")
+    elif args.no_barriers:
+        print("  barrier data ignored on request")
+    else:
+        print("  %d stops rejected: water in the way" % blocked)
     print("  reached %d of %d stops" % (len(reached), stops["count"]))
     print()
     tail = reached[len(reached) - args.top:] if args.top > 0 else []
@@ -193,7 +241,8 @@ def main():
     if args.dump:
         with open(args.dump, "w", encoding="utf-8") as fh:
             json.dump({"lat": lat, "lon": lon, "t0": t0, "horizon": horizon,
-                       "access": access,
+                       "access": access, "seeds": seeds, "blocked": blocked,
+                       "barriers": not args.no_barriers,
                        "stop": [int(i) for i in reached],
                        "arr": [int(arr[i]) for i in reached],
                        "mode": [int(mode[i]) for i in reached]}, fh)
@@ -209,6 +258,11 @@ def main():
         hit = bad.lower() not in names
         ok &= hit
         print("  %s forbid %r" % ("PASS" if hit else "FAIL", bad))
+    if args.min_blocked:
+        hit = blocked >= args.min_blocked
+        ok &= hit
+        print("  %s at least %d stops blocked by water (got %d)"
+              % ("PASS" if hit else "FAIL", args.min_blocked, blocked))
     raise SystemExit(0 if ok else 1)
 
 

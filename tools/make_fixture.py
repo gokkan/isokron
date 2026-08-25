@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import os
 import zipfile
 from datetime import date, timedelta
@@ -58,7 +59,28 @@ STOPS = {
     "Åmål station":        (59.05100, 12.70000, "A_AMAL"),
     "Bäckefors":           (58.85900, 12.16000, "A_BACKF"),
     "Bengtsfors busstn":   (59.02900, 12.22800, "A_BENGT"),
+    # Hisingen: north of the synthetic river below, and reachable from the
+    # south bank only on foot -- the line serving them connects to nothing
+    # else, so whether they light up is decided by the water check alone.
+    "Eriksberg":           (57.71600, 11.92800, "A_ERIKS"),
+    "Lindholmen":          (57.71650, 11.93800, "A_LINDH"),
+    "Frihamnen":           (57.71450, 11.97000, "A_FRIHA"),
+    # Kanaltorget faces Frihamnen across the water, 389 m away -- inside the
+    # 400 m transfer radius, so prep.py links the two on foot unless the
+    # water check stops it. Nothing else in the feed straddles the river
+    # within that radius, which is what makes the pair a clean assertion.
+    "Kanaltorget":         (57.71100, 11.97000, "A_KANAL"),
 }
+
+# A stand-in for Gota alv: two banks 330 m apart, and one bridge across.
+# Written next to the feed by --barriers, so prep.py, verify.py and the
+# browser all run the check on data CI can generate from nothing.
+RIVER_SOUTH = 57.71250
+RIVER_NORTH = 57.71350
+RIVER_WEST = 11.90000
+RIVER_EAST = 11.99000
+BRIDGE_LON = 11.96600
+BRIDGE_LEN = 260.0
 
 # route_id, short_name, route_type, headway minutes, [(stop, minute from start)]
 LINES = [
@@ -76,7 +98,7 @@ LINES = [
         ("Brunnsparken", 0), ("Munkebäckstorget", 9),
         ("Partille Centrum", 16)]),
     ("R_B400", "Grön express 400", 700, 15, [
-        ("Nils Ericsonsterm.", 0), ("Bäckebol", 9),
+        ("Nils Ericsonsterm.", 0), ("Kanaltorget", 2), ("Bäckebol", 9),
         ("Kungälv Resecentrum", 28)]),
     ("R_TR_ALE", "Västtågen Alingsås", 100, 30, [
         ("Göteborg C", 0), ("Gamlestads Torg", 5), ("Lerum station", 20),
@@ -90,6 +112,9 @@ LINES = [
         ("Mölnlycke station", 17)]),
     ("R_F281", "281", 1000, 30, [
         ("Saltholmen", 0), ("Styrsö Bratten", 20), ("Vrångö", 35)]),
+    # Hisingen, deliberately an island in the graph as well as on the map.
+    ("R_T9", "9", 900, 10, [
+        ("Eriksberg", 0), ("Lindholmen", 3), ("Frihamnen", 7)]),
     # Dalsland: two departures all morning, and nothing connects to it.
     ("R_B733", "733", 700, 150, [
         ("Åmål station", 0), ("Bäckefors", 55), ("Bengtsfors busstn", 85)]),
@@ -214,9 +239,33 @@ def build(target: date):
     return files
 
 
+def barrier_geojson():
+    """The synthetic river and its bridge, in the format prep.py reads."""
+    bank = lambda lat: {
+        "type": "Feature", "properties": {"kind": "barrier"},
+        "geometry": {"type": "LineString",
+                     "coordinates": [[RIVER_WEST, lat], [RIVER_EAST, lat]]}}
+    return {
+        "type": "FeatureCollection",
+        "source": "synthetic fixture river, not a real place",
+        "generated_at": "fixture",
+        "features": [
+            bank(RIVER_SOUTH),
+            bank(RIVER_NORTH),
+            {"type": "Feature",
+             "properties": {"kind": "gate", "len": BRIDGE_LEN},
+             "geometry": {"type": "LineString", "coordinates": [
+                 [BRIDGE_LON, RIVER_SOUTH - 0.0003],
+                 [BRIDGE_LON, RIVER_NORTH + 0.0003]]}},
+        ],
+    }
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="fixture/vt.zip")
+    ap.add_argument("--barriers", default=None,
+                    help="also write the fixture's water geometry here")
     ap.add_argument("--date", default=None,
                     help="Tuesday the fixture is centred on (default: next)")
     args = ap.parse_args()
@@ -234,6 +283,13 @@ def main():
             zf.writestr(name, text.encode("utf-8"))
     print("wrote %s (%d files, centred on %s %s)" % (
         args.out, len(files), target, target.strftime("%A")))
+
+    if args.barriers:
+        os.makedirs(os.path.dirname(os.path.abspath(args.barriers)),
+                    exist_ok=True)
+        with open(args.barriers, "w", encoding="utf-8") as fh:
+            json.dump(barrier_geojson(), fh, indent=1)
+        print("wrote %s" % args.barriers)
 
 
 if __name__ == "__main__":

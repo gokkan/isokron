@@ -28,6 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import numpy as np
 
+import barriers as water
 from gtfs import (CATEGORIES, Table, get, parse_time, pick_date,
                   resolve_services, route_category)
 
@@ -276,9 +277,119 @@ def local_xy(lats, lons):
     return [lon * kx for lon in lons], [lat * ky for lat in lats]
 
 
+def build_barriers(path, lats, lons, reach, tol_deg):
+    """Pack the committed water geometry down to what the walk can reach.
+
+    A barrier further from every stop than the longest access walk can never
+    block anything: both ends of that walk have to fit inside the same radius.
+    Dropping those is what keeps the outer archipelago and half of Vanern out
+    of the file without any judgement call about which water matters.
+    """
+    if not os.path.exists(path):
+        log("  no barrier file at {} -- access stays as the crow flies"
+            .format(path))
+        return None
+    lines, gates, source, fetched = water.load(path)
+    raw_pts = sum(len(l) for l in lines)
+
+    xs, ys = local_xy(lats, lons)
+    cell = max(reach, 1.0)
+    grid = defaultdict(list)
+    for i in range(len(xs)):
+        grid[(int(xs[i] // cell), int(ys[i] // cell))].append(i)
+    lat0 = math.radians(sum(lats) / len(lats))
+    kx = EARTH_R * math.cos(lat0) * math.pi / 180.0
+    ky = EARTH_R * math.pi / 180.0
+    reach2 = reach * reach
+
+    def near_stops(x, y):
+        cx, cy = int(x // cell), int(y // cell)
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for i in grid.get((cx + dx, cy + dy), ()):
+                    if (xs[i] - x) ** 2 + (ys[i] - y) ** 2 <= reach2:
+                        return True
+        return False
+
+    def segment_matters(alon, alat, blon, blat):
+        ax, ay = alon * kx, alat * ky
+        bx, by = blon * kx, blat * ky
+        span = math.hypot(bx - ax, by - ay)
+        steps = max(1, int(span // (reach / 2.0)) + 1)
+        for k in range(steps + 1):
+            f = k / steps
+            if near_stops(ax + (bx - ax) * f, ay + (by - ay) * f):
+                return True
+        return False
+
+    kept_lines = []
+    for line in lines:
+        pts = water.simplify(line, tol_deg)
+        run = []
+        for k in range(len(pts) - 1):
+            if segment_matters(pts[k][0], pts[k][1], pts[k + 1][0], pts[k + 1][1]):
+                if not run:
+                    run.append(pts[k])
+                run.append(pts[k + 1])
+            elif run:
+                kept_lines.append(run)
+                run = []
+        if run:
+            kept_lines.append(run)
+
+    kept_gates = [g for g in gates
+                  if near_stops(g[0][0] * kx, g[0][1] * ky)
+                  or near_stops(g[1][0] * kx, g[1][1] * ky)]
+
+    if not kept_lines:
+        log("  barrier file has nothing within {:g} m of a stop".format(reach))
+        return None
+
+    offsets = [0]
+    lon_out, lat_out = [], []
+    for line in kept_lines:
+        for x, y in line:
+            lon_out.append(x)
+            lat_out.append(y)
+        offsets.append(len(lon_out))
+    log("  barriers: {:,} lines, {:,} of {:,} points, {:,} of {:,} bridges"
+        .format(len(kept_lines), len(lon_out), raw_pts,
+                len(kept_gates), len(gates)))
+
+    packed = {
+        "lon": np.asarray(lon_out, dtype=np.float32),
+        "lat": np.asarray(lat_out, dtype=np.float32),
+        "offsets": np.asarray(offsets, dtype=np.uint32),
+        "gate_a_lon": np.asarray([g[0][0] for g in kept_gates], np.float32),
+        "gate_a_lat": np.asarray([g[0][1] for g in kept_gates], np.float32),
+        "gate_b_lon": np.asarray([g[1][0] for g in kept_gates], np.float32),
+        "gate_b_lat": np.asarray([g[1][1] for g in kept_gates], np.float32),
+        "gate_len": np.asarray([g[2] for g in kept_gates], np.float32),
+    }
+    # Build the checker from the float32 values that will be shipped, not the
+    # float64 ones that were read. prep.py and the browser then agree on the
+    # same rounded coordinates, and the cross-check has a chance.
+    bars = water.Barriers(
+        packed["lon"], packed["lat"], packed["offsets"],
+        packed["gate_a_lon"], packed["gate_a_lat"],
+        packed["gate_b_lon"], packed["gate_b_lat"], packed["gate_len"])
+    return packed, bars, {"source": source, "fetched_at": fetched,
+                          "lines": len(kept_lines), "points": len(lon_out),
+                          "gates": len(kept_gates), "reach_m": reach,
+                          "tolerance_deg": tol_deg,
+                          "shore_slack_m": water.SHORE_SLACK_M}
+
+
 def build_footpaths(zf, stop_ids, lats, lons, children, max_dist, walk_mps,
-                    default_transfer):
-    """Merge transfers.txt with generated near pairs into a CSR graph."""
+                    default_transfer, bars=None):
+    """Merge transfers.txt with generated near pairs into a CSR graph.
+
+    Generated pairs are subject to the water check: Gota alv is narrower than
+    the transfer radius in places, so without it a journey can step across the
+    river between two platforms that share nothing but a coordinate. Rows from
+    transfers.txt are exempt -- the operator saying a transfer exists outranks
+    our geometry.
+    """
     n = len(stop_ids)
     index = {sid: i for i, sid in enumerate(stop_ids)}
     xs, ys = local_xy(lats, lons)
@@ -298,6 +409,10 @@ def build_footpaths(zf, stop_ids, lats, lons, children, max_dist, walk_mps,
         grid[(int(xs[i] // cell), int(ys[i] // cell))].append(i)
     limit2 = max_dist * max_dist
     generated = 0
+    blocked = 0
+    kx_ll = EARTH_R * math.cos(math.radians(sum(lats) / len(lats))) \
+        * math.pi / 180.0
+    ky_ll = EARTH_R * math.pi / 180.0
     for (cx, cy), bucket in grid.items():
         near = []
         for dx in (-1, 0, 1):
@@ -311,11 +426,21 @@ def build_footpaths(zf, stop_ids, lats, lons, children, max_dist, walk_mps,
                 d2 = (xs[j] - xi) ** 2 + (ys[j] - yi) ** 2
                 if d2 > limit2:
                     continue
-                secs = int(math.ceil(math.sqrt(d2) / walk_mps))
+                dist = math.sqrt(d2)
+                if bars is not None:
+                    dist = water.walk_distance(
+                        bars, lons[i], lats[i], lons[j], lats[j],
+                        max_dist, kx_ll, ky_ll)
+                    if dist is None:
+                        blocked += 1
+                        continue
+                secs = int(math.ceil(dist / walk_mps))
                 offer(i, j, secs)
                 offer(j, i, secs)
                 generated += 1
     log("  generated {:,} walk pairs within {:g} m".format(generated, max_dist))
+    if bars is not None:
+        log("  {:,} pairs dropped: water in the way".format(blocked))
 
     # transfers.txt wins wherever it is more specific
     applied = 0
@@ -421,6 +546,16 @@ def main(argv=None):
                     help="metres")
     ap.add_argument("--default-transfer", type=int, default=120,
                     help="seconds for a transfers.txt entry with no time")
+    ap.add_argument("--barriers", default=os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "barriers.geojson"),
+        help="water geometry to check walks against; absent is not an error")
+    ap.add_argument("--no-barriers", action="store_true",
+                    help="ignore the water check entirely, as the crow flies")
+    ap.add_argument("--barrier-reach", type=float, default=1700.0,
+                    help="metres; barriers further than this from every stop "
+                         "cannot block any walk and are dropped")
+    ap.add_argument("--barrier-tolerance", type=float, default=0.0004,
+                    help="Douglas-Peucker tolerance in degrees, about 40 m")
     ap.add_argument("--no-gzip", action="store_true")
     args = ap.parse_args(argv)
 
@@ -486,10 +621,16 @@ def main(argv=None):
         log("  {:,} stop points group into {:,} stop areas".format(
             len(stop_ids), len(g_name)))
 
+        log("reading barriers...")
+        built = None if args.no_barriers else build_barriers(
+            args.barriers, lats, lons, args.barrier_reach,
+            args.barrier_tolerance)
+        barrier_arrays, bars, barrier_meta = built or (None, None, None)
+
         log("building footpaths...")
         fp_offsets, fp_targets, fp_seconds = build_footpaths(
             zf, stop_ids, lats, lons, children, args.transfer_radius,
-            walk_mps, args.default_transfer)
+            walk_mps, args.default_transfer, bars)
         log("  footpath edges: {:,} (avg {:.1f} per stop)".format(
             len(fp_targets), len(fp_targets) / max(len(stop_ids), 1)))
 
@@ -538,6 +679,14 @@ def main(argv=None):
         "stops": len(stop_ids), "edges": int(len(fp_targets)),
         "bytes": fp_bytes, "arrays": fp_header,
     }, do_gzip)
+    if barrier_arrays is not None:
+        bar_header, bar_bytes = write_blob(
+            os.path.join(out, "barriers.bin"),
+            [(name, barrier_arrays[name]) for name in
+             ("lon", "lat", "offsets", "gate_a_lon", "gate_a_lat",
+              "gate_b_lon", "gate_b_lat", "gate_len")], do_gzip)
+        write_json(os.path.join(out, "barriers.json"), dict(
+            barrier_meta, bytes=bar_bytes, arrays=bar_header), do_gzip)
     write_json(os.path.join(out, "stops.json"), {
         "count": len(stop_ids),
         "id": stop_ids,
@@ -566,6 +715,7 @@ def main(argv=None):
         "window_end": args.window_end,
         "walk_speed_kmh": args.walk_speed,
         "transfer_radius_m": args.transfer_radius,
+        "barriers": barrier_meta,
         "generated_at": datetime.now(timezone.utc).replace(
             microsecond=0).isoformat(),
         "counts": {"stops": len(stop_ids), "stop_areas": len(g_name),
