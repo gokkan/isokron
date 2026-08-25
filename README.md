@@ -21,8 +21,8 @@ tests/      korskontroll av de två sökimplementationerna, plus ett rökprov
 pip install -r prep/requirements.txt
 
 # 1. Bygg data. Utan nyckel: kör mot den syntetiska feeden.
-python tools/make_fixture.py --out fixture/vt.zip
-python prep/prep.py --zip fixture/vt.zip --out public/data
+python tools/make_fixture.py --out fixture/vt.zip --barriers fixture/vatten.geojson
+python prep/prep.py --zip fixture/vt.zip --out public/data --barriers fixture/vatten.geojson
 
 # 2. Kontrollera att svaret är rimligt innan du tittar på kartan.
 python prep/verify.py --stop Brunnsparken --time 08:00 --horizon 30
@@ -88,11 +88,15 @@ komprimera `application/octet-stream`.
   sökningen kör på lägen, ritningen på stop areas. Feeden har ett läge per
   riktning, så utan gruppering ritas varje hållplats två eller tre gånger och
   varje sträcka en gång per plattformspar. 15 780 lägen blir 8 474 hållplatser.
+- `barriers.bin` — vattengeometrin: `lon`/`lat` som float32 plus `offsets`
+  som avgränsar varje strandlinje, och broarna som sina två landfästen
+  (`gate_a_*`, `gate_b_*`) med gånglängden i `gate_len`. Finns bara om bygget
+  hade en källfil att packa; saknas den går gången fågelvägen som förut.
 - `trips.json`, `connections.json`, `footpaths.json`, `meta.json`.
 
 ## Avsteg från ursprungsplanen
 
-Fyra, alla medvetna:
+Fem, alla medvetna:
 
 1. **Tidsfönstret är 05:45–12:15, inte 06:00–10:00.** Skjutreglaget går till
    10:15 och den längsta horisonten är 120 minuter, så avgångar måste finnas
@@ -133,6 +137,56 @@ Fyra, alla medvetna:
 4. **`trips.json` som struct-of-arrays** — en avduplicerad linjetabell plus ett
    linjeindex per tur, i stället för ett objekt per tur. Samma innehåll,
    ungefär en tiondel så stort.
+5. **Vatten är ett hinder, broar är hål i det.** Fågelvägen är en god
+   approximation för gång ända tills den korsar Göta älv. En klickpunkt på
+   Södra Älvstranden hamnar annars inom tio minuters "gång" från lägen på
+   Hisingen, och kartan påstår sedan att resan börjar på en hållplats man
+   inte kan ta sig till — vilket är värre än att sakna den, eftersom felet är
+   osynligt. Samma sak gäller bytesgångarna: Göta älv är på sina ställen
+   smalare än de 400 meter `footpaths.bin` länkar inom.
+
+   Därför bär datat en förenklad vattengeometri. Innan en hållplats sås testas
+   sträckan klickpunkt–hållplats mot strandlinjerna; korsar den, räknas
+   avståndet om som vägen via en bro, och ryms inte den i gångbudgeten sås
+   hållplatsen inte alls. Samma test gallrar de genererade fotstigarna i
+   `prep.py`. Rader ur `transfers.txt` går fria — operatörens uppgift om att
+   ett byte finns väger tyngre än vår geometri.
+
+   Två detaljer avgör om det fungerar i praktiken. **En bro är inte en punkt:**
+   den bärs som sina två landfästen plus gånglängden mellan dem, för en punkt
+   mitt i älven vore oanvändbar — vägen dit korsar ju närmaste strand först.
+   Och **en korsning inom 35 meter från någondera änden räknas inte**, för
+   feedens koordinater lägger med jämna mellanrum ett kajläge några meter ut i
+   vattnet, och utan den regeln blir Stenpiren onåbart från alla håll samtidigt.
+   Slacken räddar aldrig en riktig korsning: motsatta stranden ligger hundratals
+   meter från båda ändarna.
+
+   Färjor är inte broar. Västtrafiks älvsnabbar ligger redan i tidtabellen som
+   avgångar och kommer in i sökningen som trafik — annars skulle en klickpunkt
+   vid Stenpiren "gå" över till Lindholmen på fyrtio sekunder. Bara
+   `highway`-vägar med `bridge` blir broar, och `foot=no` sorteras bort, vilket
+   är det som håller Tingstadstunneln utanför.
+
+   Geometrin kommer från OpenStreetMap, ligger committad som
+   `prep/barriers.geojson` och förenklas till ungefär 40 meter — sökningens
+   upplösning är hundratals meter, så mer detalj kostar bara plats. `prep.py`
+   slänger dessutom allt som ligger längre från närmaste hållplats än den
+   längsta tillgångsgången (1 700 m): en strandlinje som ingen gångbudget
+   når kan inte hindra någon, och det är den regeln som håller yttre
+   skärgården borta ur filen utan att någon behöver tycka till om vilket
+   vatten som spelar roll.
+
+   Veckobygget hämtar ingenting nytt. `prep/fetch_barriers.py` körs för hand
+   eller via `workflow_dispatch` (`.github/workflows/barriers.yml`), och
+   resultatet granskas som en pull request innan det committas. Saknas filen
+   faller allt tillbaka på fågelvägen, exakt som förut — och det är den vägen
+   ett bygge utan geometri går.
+
+   Kvarvarande fel, och de är kända: bara **en** bro per gångsträcka söks, så
+   en väg som kräver både älv och kanal hittas inte; på land hindrar
+   ingenting, varken motorväg, järnväg eller stup; och en genväg som skär
+   utsidan av en älvkrök blockeras trots att den bara nuddar vattnet, vilket
+   är fel åt det försiktiga hållet.
 
 Färgen per hållplats är det färdmedel som stod för mest åktid på resan dit, som
 planen beskriver: `modeTime` bär en sekundsumma per kategori genom hela
@@ -148,6 +202,21 @@ python prep/verify.py --stop Brunnsparken --time 08:00 --horizon 30 --top 0 `
 
 # samma sökning i webbläsarkoden — måste ge exakt samma ankomsttider
 node tests/client.test.mjs public/data tmp/dump.json
+```
+
+Vattenkontrollen har sina egna påståenden, och fixturen bär en syntetisk älv
+med en bro över för att kunna göra dem utan nätverk:
+
+```powershell
+# blockerad: hållplatsen ligger på andra sidan, närmaste bro för långt bort
+python prep/verify.py --data tmp/fixture-data --at 57.7105,11.9380 `
+  --time 08:00 --horizon 30 --top 0 --forbid Lindholmen --min-blocked 2
+# samma klick utan kontrollen ger det gamla, felaktiga svaret
+python prep/verify.py --data tmp/fixture-data --at 57.7105,11.9380 `
+  --time 08:00 --horizon 30 --top 0 --no-barriers --expect Lindholmen
+# intill bron går det, med omvägen inräknad i gångtiden
+python prep/verify.py --data tmp/fixture-data --at 57.7105,11.9660 `
+  --time 08:00 --horizon 30 --top 0 --expect Frihamnen
 ```
 
 `prep/verify.py` och sökningen i `public/app.js` är samma algoritm skriven två
@@ -183,7 +252,8 @@ hela `public/` som Pages-artefakt. Datat committas aldrig.
 
 ## Icke-mål i v1
 
-Gaturoutad gång (fågelvägen räcker), realtidsdata (Västtrafik levererar ingen
+Gaturoutad gång — fågelvägen räcker på land, men inte över vatten
+(se avsteg 5) —, realtidsdata (Västtrafik levererar ingen
 GTFS-RT till Trafiklab), POI-lager, andra operatörers feeds, helger, och
 nattrafiken efter 22:00.
 
@@ -199,3 +269,8 @@ datatyp per array och klienten läser den, så det är en avgränsad ändring i
 Tidtabellsdata från Trafiklab / Samtrafiken, GTFS Regional, CC0. Kartunderlag
 © OpenStreetMap-bidragsgivare, © CARTO. Beräkningen bygger på tidtabell, inte
 faktisk trafik.
+
+Vattengeometrin i `prep/barriers.geojson` och `barriers.bin` är härledd ur
+OpenStreetMap och står under **ODbL** — en annan licens än den CC0-märkta
+tidtabellen, och den enda delen av datat som bär villkor vidare till den som
+återanvänder den.

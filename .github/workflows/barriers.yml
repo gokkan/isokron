@@ -1,0 +1,79 @@
+name: Refresh water geometry
+
+# Manual only, and deliberately so. The weekly build must never depend on
+# Overpass being up: it reads prep/barriers.geojson from the repository, the
+# same way it reads the fixture. This job is how that file gets replaced --
+# rarely, when a bridge opens or the region grows.
+on:
+  workflow_dispatch:
+    inputs:
+      bbox:
+        description: "south,west,north,east"
+        default: "57.20,11.00,59.35,14.80"
+      tolerance:
+        description: "Douglas-Peucker tolerance in degrees (0.0004 ≈ 40 m)"
+        default: "0.0004"
+      endpoint:
+        description: "Overpass endpoint"
+        default: "https://overpass-api.de/api/interpreter"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Python deps
+        run: pip install -r prep/requirements.txt
+
+      - name: Fetch from OpenStreetMap
+        run: |
+          python prep/fetch_barriers.py --out prep/barriers.geojson \
+            --bbox "${{ inputs.bbox }}" \
+            --tolerance "${{ inputs.tolerance }}" \
+            --endpoint "${{ inputs.endpoint }}"
+
+      # The new geometry has to survive the whole pipeline before anyone is
+      # asked to look at it: prep must pack it, and both search
+      # implementations must still agree stop for stop.
+      - name: Prove the pipeline still runs on it
+        run: |
+          mkdir -p tmp
+          python tools/make_fixture.py --out tmp/fixture.zip \
+            --barriers tmp/fixture-barriers.geojson
+          python prep/prep.py --zip tmp/fixture.zip --out tmp/fixture-data \
+            --barriers tmp/fixture-barriers.geojson
+          python prep/verify.py --data tmp/fixture-data --stop Brunnsparken \
+            --time 08:00 --horizon 30 --top 0 --dump tmp/dump.json \
+            --expect Angered --expect Frölunda --expect Mölndal \
+            --expect Partille --forbid Kungälv
+          node tests/client.test.mjs tmp/fixture-data tmp/dump.json
+
+      # A pull request rather than a push: this file decides what the map
+      # claims about the world, and a diff of it is worth a pair of eyes.
+      - uses: peter-evans/create-pull-request@v6
+        with:
+          branch: barriers/refresh
+          title: "Uppdatera vattengeometrin från OpenStreetMap"
+          commit-message: "Uppdatera vattengeometrin från OpenStreetMap"
+          body: |
+            Hämtad med `prep/fetch_barriers.py` inom
+            `${{ inputs.bbox }}`, förenklad med tolerans
+            `${{ inputs.tolerance }}`.
+
+            Geometrin är härledd ur OpenStreetMap och står under ODbL.
+            Titta på diffen i en kartvisare innan den går in — den avgör
+            vilka hållplatser kartan påstår att man kan gå till.
+          add-paths: prep/barriers.geojson

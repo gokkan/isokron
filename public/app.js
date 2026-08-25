@@ -20,6 +20,9 @@ const LEG_WALK = -1;               // reached on foot from another stop
 const INF = 0x7fffffff;
 const EARTH_CIRC = 40075016.686;
 const EARTH_R = 6371008.8;
+const TAU = 6.283185307179586;
+const SHORE_SLACK = 35;            // see the barrier section for what this is
+const REACH_RAYS = 128;            // directions the drawn walk outline samples
 
 const el = (id) => document.getElementById(id);
 
@@ -80,24 +83,43 @@ function unpack(buffer, header) {
 
 const D = {};   // everything loaded, filled in by boot()
 
+/* The barrier files are the one part of the data that may simply not be
+ * there: build without them and walking is as the crow flies, which is what
+ * it was before they existed. Absence is not an error, so this cannot join
+ * the Promise.all above. */
+async function loadOptional(jsonName, binName) {
+  try {
+    const header = await fetchJSON(jsonName);
+    return { header, buf: await fetchBinary(binName) };
+  } catch (err) {
+    return null;
+  }
+}
+
 async function loadData() {
   const [meta, stops, trips, connHeader, fpHeader] = await Promise.all(
     ['meta.json', 'stops.json', 'trips.json', 'connections.json',
      'footpaths.json'].map(fetchJSON));
-  const [connBuf, fpBuf] = await Promise.all(
-    [fetchBinary('connections.bin'), fetchBinary('footpaths.bin')]);
-  ingest({ meta, stops, trips, connHeader, connBuf, fpHeader, fpBuf });
+  const [connBuf, fpBuf, barriers] = await Promise.all(
+    [fetchBinary('connections.bin'), fetchBinary('footpaths.bin'),
+     loadOptional('barriers.json', 'barriers.bin')]);
+  ingest({ meta, stops, trips, connHeader, connBuf, fpHeader, fpBuf,
+           barrierHeader: barriers && barriers.header,
+           barrierBuf: barriers && barriers.buf });
 }
 
 /* Turn the loaded files into the flat arrays the search wants. Split out from
  * loadData so tests/client.test.mjs can feed it straight off disk. */
-function ingest({ meta, stops, trips, connHeader, connBuf, fpHeader, fpBuf }) {
+function ingest({ meta, stops, trips, connHeader, connBuf, fpHeader, fpBuf,
+                  barrierHeader, barrierBuf }) {
   D.meta = meta;
   D.stops = stops;
   D.trips = trips;
   D.header = connHeader;
   D.conn = unpack(connBuf, connHeader);
   D.fp = unpack(fpBuf, fpHeader);
+  D.barriers = (barrierHeader && barrierBuf)
+    ? buildBarriers(barrierHeader, unpack(barrierBuf, barrierHeader)) : null;
   D.nStops = stops.count;
   D.nTrips = trips.trip_route.length;
   D.nCats = trips.categories.length;
@@ -147,6 +169,175 @@ function ingest({ meta, stops, trips, connHeader, connBuf, fpHeader, fpBuf }) {
   D.order = new Uint32Array(D.nStops);
 }
 
+/* --------------------------------------------------------------- barriers */
+
+/* Water you cannot walk across, and the bridges where you can. The rules are
+ * prep/barriers.py written a second time; change one and change the other,
+ * exactly as with the search itself. Two of them:
+ *
+ *   1. A walk is blocked if the straight line between its ends crosses a
+ *      barrier. Blocked, it may instead reach a bridge landing, pay the
+ *      bridge, and go on from the far landing — both legs judged the same way.
+ *   2. A crossing within SHORE_SLACK of an end does not count. Feed
+ *      coordinates put a quayside stop a few metres into the water often
+ *      enough that without this, stops along Stenpiren would be unreachable
+ *      from every direction at once — a silent, total failure. Slack at one
+ *      end never rescues a real crossing: the far bank is hundreds of metres
+ *      from both ends.
+ *
+ * Crossing tests run in degrees. Segment intersection survives any affine map
+ * and lon/lat → metres is a diagonal scaling, so the answer is the same and no
+ * projection has to be agreed on with the search, which measures its distances
+ * about the click latitude and must go on doing exactly that.
+ */
+
+function buildBarriers(header, a) {
+  // one entry per segment, holding the index of its first point
+  let count = 0;
+  for (let l = 0; l + 1 < a.offsets.length; l++) {
+    count += Math.max(0, a.offsets[l + 1] - a.offsets[l] - 1);
+  }
+  const seg = new Uint32Array(count);
+  let s = 0;
+  for (let l = 0; l + 1 < a.offsets.length; l++) {
+    for (let p = a.offsets[l]; p + 1 < a.offsets[l + 1]; p++) seg[s++] = p;
+  }
+  return {
+    lon: a.lon, lat: a.lat, seg,
+    gateALon: a.gate_a_lon, gateALat: a.gate_a_lat,
+    gateBLon: a.gate_b_lon, gateBLat: a.gate_b_lat, gateLen: a.gate_len,
+    nGates: a.gate_len.length,
+    meta: header,
+    // scratch, so a search allocates nothing: which segments the walking disc
+    // can reach at all, filled once per click
+    cand: new Uint32Array(count),
+    reach: new Float32Array(REACH_RAYS),
+  };
+}
+
+/* Segments the disc around a click can possibly touch. Everywhere in Västra
+ * Götaland that is not beside water this returns zero, and the whole feature
+ * costs one pass over a few thousand bounding boxes and nothing more. */
+function collectSegments(B, lon, lat, radius, kx, ky) {
+  const dLon = radius / kx, dLat = radius / ky;
+  const minLon = lon - dLon, maxLon = lon + dLon;
+  const minLat = lat - dLat, maxLat = lat + dLat;
+  const bl = B.lon, ba = B.lat, seg = B.seg, cand = B.cand;
+  let n = 0;
+  for (let k = 0; k < seg.length; k++) {
+    const p = seg[k];
+    const x0 = bl[p], x1 = bl[p + 1], y0 = ba[p], y1 = ba[p + 1];
+    if ((x0 < minLon && x1 < minLon) || (x0 > maxLon && x1 > maxLon)) continue;
+    if ((y0 < minLat && y1 < minLat) || (y0 > maxLat && y1 > maxLat)) continue;
+    cand[n++] = p;
+  }
+  return n;
+}
+
+/* Where a-b crosses c-d, as a fraction along a-b, or -1 for no crossing.
+ * Proper crossings only: segments that merely touch at an endpoint do not
+ * count, and neither does collinear overlap — that is walking along a bank,
+ * not across it. */
+function segHit(ax, ay, bx, by, cx, cy, dx, dy) {
+  const rx = bx - ax, ry = by - ay;
+  const sx = dx - cx, sy = dy - cy;
+  const denom = rx * sy - ry * sx;
+  if (denom === 0) return -1;
+  const qx = cx - ax, qy = cy - ay;
+  const t = (qx * sy - qy * sx) / denom;
+  if (t <= 0 || t >= 1) return -1;
+  const u = (qx * ry - qy * rx) / denom;
+  if (u <= 0 || u >= 1) return -1;
+  return t;
+}
+
+function crosses(B, nCand, alon, alat, blon, blat, kx, ky, slack) {
+  const bl = B.lon, ba = B.lat, cand = B.cand;
+  const slack2 = slack * slack;
+  for (let k = 0; k < nCand; k++) {
+    const p = cand[k];
+    const t = segHit(alon, alat, blon, blat,
+                     bl[p], ba[p], bl[p + 1], ba[p + 1]);
+    if (t < 0) continue;
+    if (slack2 > 0) {
+      const hx = alon + (blon - alon) * t;
+      const hy = alat + (blat - alat) * t;
+      const dax = (alon - hx) * kx, day = (alat - hy) * ky;
+      if (dax * dax + day * day <= slack2) continue;
+      const dbx = (blon - hx) * kx, dby = (blat - hy) * ky;
+      if (dbx * dbx + dby * dby <= slack2) continue;
+    }
+    return true;
+  }
+  return false;
+}
+
+/* Where a blocked walk can pick up again, having paid for a bridge: the far
+ * landing, and the metres already spent reaching the near one and crossing.
+ * Sorted by cost, then by index — prep/barriers.py sorts the same way, and a
+ * tie has to break identically or the two answers drift apart. */
+function gateExits(B, nCand, lon, lat, budget, kx, ky, slack) {
+  const out = [];
+  for (let gi = 0; gi < B.nGates; gi++) {
+    for (let near = 0; near < 2; near++) {
+      const nLon = near === 0 ? B.gateALon[gi] : B.gateBLon[gi];
+      const nLat = near === 0 ? B.gateALat[gi] : B.gateBLat[gi];
+      const fLon = near === 0 ? B.gateBLon[gi] : B.gateALon[gi];
+      const fLat = near === 0 ? B.gateBLat[gi] : B.gateALat[gi];
+      const dx = (nLon - lon) * kx, dy = (nLat - lat) * ky;
+      const cost = Math.sqrt(dx * dx + dy * dy) + B.gateLen[gi];
+      if (cost > budget) continue;
+      if (crosses(B, nCand, lon, lat, nLon, nLat, kx, ky, slack)) continue;
+      out.push({ cost, rank: gi * 2 + near, lon: fLon, lat: fLat });
+    }
+  }
+  out.sort((a, b) => (a.cost - b.cost) || (a.rank - b.rank));
+  return out;
+}
+
+/* Metres on foot from a to b, or -1 if there is no way inside budget.
+ * Straight-line unless water is in the way, and then over one bridge. Two
+ * bridges in one walk is not searched for: inside a twenty minute budget that
+ * does not happen. */
+function walkDistance(B, nCand, exits, alon, alat, blon, blat, direct, budget,
+                      kx, ky, slack) {
+  if (!crosses(B, nCand, alon, alat, blon, blat, kx, ky, slack)) return direct;
+  let best = -1;
+  for (let k = 0; k < exits.length; k++) {
+    const e = exits[k];
+    if (e.cost > budget || (best >= 0 && e.cost >= best)) break;
+    const dx = (blon - e.lon) * kx, dy = (blat - e.lat) * ky;
+    const total = e.cost + Math.sqrt(dx * dx + dy * dy);
+    if (total > budget || (best >= 0 && total >= best)) continue;
+    if (crosses(B, nCand, e.lon, e.lat, blon, blat, kx, ky, slack)) continue;
+    best = total;
+  }
+  return best;
+}
+
+/* How far the walk gets in each of REACH_RAYS directions before it hits
+ * water. Sampled once per search, not per frame; the animation only clips it
+ * shorter as the clock runs. No slack here: this is a drawing, and a ray that
+ * shrugged off the bank it starts on would draw a circle straight across the
+ * river. */
+function reachProfile(B, nCand, out, lon, lat, budget, kx, ky) {
+  const bl = B.lon, ba = B.lat, cand = B.cand;
+  for (let r = 0; r < REACH_RAYS; r++) {
+    const angle = r * TAU / REACH_RAYS;
+    // a unit vector in metres, expressed in degrees
+    const ux = Math.cos(angle) / kx, uy = Math.sin(angle) / ky;
+    let best = budget;
+    for (let k = 0; k < nCand; k++) {
+      const p = cand[k];
+      const t = segHit(lon, lat, lon + ux * budget, lat + uy * budget,
+                       bl[p], ba[p], bl[p + 1], ba[p + 1]);
+      if (t >= 0 && t * budget < best) best = t * budget;
+    }
+    out[r] = best;
+  }
+  return out;
+}
+
 /* ----------------------------------------------------------------- search */
 
 /* Connection scan. `t0` and the result are seconds from the data window's
@@ -172,18 +363,42 @@ function search(lon, lat, t0, horizon, accessSec) {
   const phi = lat * Math.PI / 180;
   const kx = EARTH_R * Math.cos(phi) * Math.PI / 180;
   const ky = EARTH_R * Math.PI / 180;
-  let seeds = 0;
+
+  // Water between the click point and a stop makes the crow's distance a
+  // lie. Narrow the barriers down to the ones this disc can reach first: a
+  // click anywhere away from water leaves nCand at zero and the rest of the
+  // walk stays exactly the arithmetic it always was.
+  const B = D.barriers;
+  let nCand = 0, exits = null, reach = null;
+  if (B) {
+    nCand = collectSegments(B, lon, lat, seedRadius, kx, ky);
+    if (nCand) {
+      exits = gateExits(B, nCand, lon, lat, seedRadius, kx, ky, SHORE_SLACK);
+      reach = reachProfile(B, nCand, B.reach, lon, lat, seedRadius, kx, ky);
+    }
+  }
+
+  let seeds = 0, blocked = 0;
   let nearest = Infinity;
   for (let i = 0; i < n; i++) {
     const dx = (D.stops.lon[i] - lon) * kx;
     const dy = (D.stops.lat[i] - lat) * ky;
     const d = Math.sqrt(dx * dx + dy * dy);
     if (d < nearest) nearest = d;
-    if (d <= seedRadius) {
-      arr[i] = t0 + Math.ceil(d / WALK_MPS);
-      prevTime[i] = t0;
-      seeds++;
+    if (d > seedRadius) continue;
+    let w = d;
+    if (nCand) {
+      w = walkDistance(B, nCand, exits, lon, lat,
+                       D.stops.lon[i], D.stops.lat[i], d, seedRadius,
+                       kx, ky, SHORE_SLACK);
+      // Nothing to fall back on when every nearby stop turns out to be
+      // across the water. That is not a failure to answer, it is the
+      // answer, and runFrom says so rather than reverting to the crow.
+      if (w < 0) { blocked++; continue; }
     }
+    arr[i] = t0 + Math.ceil(w / WALK_MPS);
+    prevTime[i] = t0;
+    seeds++;
   }
 
   const limit = t0 + horizon;
@@ -272,8 +487,28 @@ function search(lon, lat, t0, horizon, accessSec) {
   const groups = D.gOrder.subarray(0, gCount);
   groups.sort((a, b) => gArr[a] - gArr[b]);
 
+  // The far side of every bridge the walk can pay for, with the metres it
+  // cost to get there, so the paint loop can draw the reach beyond it.
+  const lobes = [];
+  if (nCand) {
+    for (let k = 0; k < exits.length; k++) {
+      const e = exits[k];
+      if (seedRadius - e.cost < 60) continue;      // too little to be visible
+      const lPhi = e.lat * Math.PI / 180;
+      lobes.push({
+        cost: e.cost,
+        reach: reachProfile(B, nCand, new Float32Array(REACH_RAYS),
+                            e.lon, e.lat, seedRadius - e.cost, kx, ky),
+        mercX: (e.lon + 180) / 360,
+        mercY: 0.5 - Math.log(Math.tan(Math.PI / 4 + lPhi / 2)) / (2 * Math.PI),
+        mPerMerc: 1 / (EARTH_CIRC * Math.cos(lPhi)),
+      });
+    }
+  }
+
   return {
     reached, count, groups, gCount, longest, farthest, seeds, scanned, nearest,
+    blocked, reach, lobes,
     t0, horizon, accessSec, lon, lat,
     mercX: (lon + 180) / 360,
     mercY: 0.5 - Math.log(Math.tan(Math.PI / 4 + phi / 2)) / (2 * Math.PI),
@@ -468,10 +703,15 @@ function paintNetwork({ kx, ky, ox, oy }) {
     vctx.strokeStyle = walkColor;
     vctx.lineWidth = 1.4 * dpr;
     vctx.setLineDash([5 * dpr, 5 * dpr]);
-    vctx.beginPath();
-    vctx.arc((current.mercX * kx + ox) * dpr, (current.mercY * ky + oy) * dpr,
-             walked * current.mPerMerc * kx * dpr, 0, 6.283185307179586);
-    vctx.stroke();
+    traceReach(current, current.reach, walked, kx, ky, ox, oy);
+    // and once more beyond each bridge the walk can afford, which is the
+    // part of the answer a single circle can never show
+    for (let k = 0; k < current.lobes.length; k++) {
+      const lobe = current.lobes[k];
+      if (walked > lobe.cost) {
+        traceReach(lobe, lobe.reach, walked - lobe.cost, kx, ky, ox, oy);
+      }
+    }
     vctx.setLineDash([]);
   }
 
@@ -510,6 +750,32 @@ function paintNetwork({ kx, ky, ox, oy }) {
     vctx.stroke();
   }
   return live;
+}
+
+/* One dashed outline of how far the walk has got. With no barrier data in
+ * range this is the circle it has always been; with barriers it is the same
+ * circle sampled in REACH_RAYS directions and cut short wherever the bank
+ * comes first, so the map stops claiming a shore it cannot cross. Mercator y
+ * grows southward and so does the canvas, hence the negated sine. */
+function traceReach(centre, reach, walked, kx, ky, ox, oy) {
+  const cx = (centre.mercX * kx + ox) * dpr;
+  const cy = (centre.mercY * ky + oy) * dpr;
+  vctx.beginPath();
+  if (!reach) {
+    vctx.arc(cx, cy, walked * centre.mPerMerc * kx * dpr, 0, TAU);
+    vctx.stroke();
+    return;
+  }
+  const unit = centre.mPerMerc * dpr;
+  for (let r = 0; r < REACH_RAYS; r++) {
+    const angle = r * TAU / REACH_RAYS;
+    const d = Math.min(walked, reach[r]);
+    const x = cx + Math.cos(angle) * d * unit * kx;
+    const y = cy - Math.sin(angle) * d * unit * ky;
+    if (r === 0) vctx.moveTo(x, y); else vctx.lineTo(x, y);
+  }
+  vctx.closePath();
+  vctx.stroke();
 }
 
 /* The old rendering, kept behind a checkbox: how far you could walk from
@@ -669,14 +935,25 @@ function runFrom(lon, lat) {
   const walkMin = Math.round(current.nearest / WALK_MPS / 60);
   const note = pendingNote ? ' ' + pendingNote : '';
   pendingNote = '';
-  if (current.count === 0) {
+  // Stops the water check threw out are worth naming. Silence would leave
+  // the map looking simply empty, which is a different claim entirely.
+  const water = current.blocked
+    ? ' ' + current.blocked + (current.blocked === 1
+        ? ' hållplatsläge ligger' : ' hållplatslägen ligger') +
+      ' på andra sidan vattnet.'
+    : '';
+  if (current.count === 0 && current.blocked) {
+    say('Ingen hållplats inom ' + accessMin + ' minuters gång — de närmaste ' +
+        'ligger på andra sidan vattnet, och närmaste bro är för långt bort. ' +
+        'Öka gångviljan, eller flytta klickpunkten till rätt sida.' + note);
+  } else if (current.count === 0) {
     say('Ingen hållplats inom ' + accessMin + ' minuters gång — närmaste ' +
         'ligger ' + walkMin + ' minuter bort. Öka gångviljan, eller läs det ' +
         'som svaret: härifrån reser man inte kollektivt.' + note);
   } else {
     say('Sökning: ' + ms.toFixed(0) + ' ms, ' +
         current.scanned.toLocaleString('sv-SE') + ' avgångar granskade. ' +
-        'Närmaste hållplats: ' + walkMin + ' min gång.' + note);
+        'Närmaste hållplats: ' + walkMin + ' min gång.' + water + note);
   }
   writeURL(lon, lat);
   el('clock').hidden = false;
@@ -933,6 +1210,18 @@ async function boot() {
     D.meta.window_start + '–' + D.meta.window_end + ')';
   el('metaBuilt').textContent = D.meta.generated_at.slice(0, 10);
 
+  // Water geometry is derived from OpenStreetMap and carries ODbL with it,
+  // which is a different licence from the CC0 timetable. Say so when it is
+  // actually in use, and say nothing when the build ran without it.
+  const bar = D.meta.barriers;
+  if (bar) {
+    const line = el('metaBarriers');
+    line.textContent = 'Vattengeometrin är härledd ur OpenStreetMap ('
+      + bar.lines.toLocaleString('sv-SE') + ' strandlinjer, '
+      + bar.gates.toLocaleString('sv-SE') + ' broar) och står under ODbL.';
+    line.hidden = false;
+  }
+
   // The slider may not run to 10:00 if the prepared window is narrower;
   // keep it inside what a 60 minute horizon can actually reach.
   const slider = el('depart');
@@ -952,5 +1241,8 @@ async function boot() {
 if (typeof document !== 'undefined') {
   boot();
 } else if (typeof module !== 'undefined') {
-  module.exports = { D, ingest, search, WALK_MPS, MIN_CHANGE };
+  module.exports = {
+    D, ingest, search, WALK_MPS, MIN_CHANGE, SHORE_SLACK,
+    segHit, crosses, collectSegments, gateExits, walkDistance, buildBarriers,
+  };
 }
