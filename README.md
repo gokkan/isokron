@@ -103,14 +103,27 @@ komprimera `application/octet-stream`.
 python prep/fetch_barriers.py --out prep/barriers.geojson
 ```
 
-En full regionkörning är över hundra Overpass-anrop, och fair-use-gränsen
-avbryter någonstans i mitten av det. Därför cachar skriptet varje svar per
-fråga under `tmp/overpass`, så en avbruten körning återupptas i stället för
-att börja om. Prova gärna en mindre ruta först — kedjan är densamma:
+**Förvalet är Göta älv-korridoren, inte hela regionen.** Det är där
+fågelvägen går över vatten som folk faktiskt står bredvid, och den kostar en
+handfull Overpass-anrop. Hela regionen är ett giltigt värde och har provats:
+den är över hundra anrop, och tappade värden två gånger innan den hann bli
+klar. Vidga medvetet och i steg:
 
 ```powershell
-python prep/fetch_barriers.py --out tmp/gbg.geojson --bbox 57.60,11.75,57.85,12.15
+python prep/fetch_barriers.py --out prep/barriers.geojson --bbox 57.20,11.00,59.35,14.80
 ```
+
+Skriptet cachar varje svar per fråga under `tmp/overpass`, så en avbruten
+körning återupptas i stället för att börja om — och cachen är *inte* nycklad
+per område, vilket är avsiktligt: att smalna av efter en misslyckad körning
+skulle annars slänga varje ruta den hann hämta, i det ögonblick cachen är som
+mest värd. Ett vidare område återanvänder alltså allt ett smalare redan
+hämtat.
+
+Kvar utanför korridoren, och värt att veta: Nordre älv vid Kungälv, Göta älv
+uppströms mot Lilla Edet och Trollhättan, Byfjorden i Uddevalla och sunden
+kring Orust och Tjörn beter sig som förut, alltså fågelvägen rakt över
+vattnet. Skärgården söder om Göteborg ryms i korridoren och hanteras rätt.
 
 Tre saker skriptet gör som är värda att veta om:
 
@@ -220,6 +233,11 @@ Fem, alla medvetna:
    når kan inte hindra någon, och det är den regeln som håller yttre
    skärgården borta ur filen utan att någon behöver tycka till om vilket
    vatten som spelar roll.
+
+   Området är tills vidare Göta älv-korridoren och inte hela Västtrafik. Det
+   är ett hämtningsbeslut, inte ett kontrollbeslut: koden bryr sig inte om hur
+   stort området är, och den som vidgar det får resten på köpet. Se
+   *Vattengeometrin* för varför, och för vad som ligger utanför.
 
    Veckobygget hämtar ingenting nytt. `prep/fetch_barriers.py` körs för hand
    eller i Actions, och resultatet granskas innan det committas. Saknas filen

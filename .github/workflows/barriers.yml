@@ -15,7 +15,13 @@ on:
     inputs:
       bbox:
         description: "south,west,north,east"
-        default: "57.20,11.00,59.35,14.80"
+        # The Gota alv corridor, which is where the crow flies over water
+        # that people actually stand beside. The whole region is a valid
+        # value and was tried: it takes over a hundred Overpass requests and
+        # lost the host twice before finishing. Widen deliberately, in steps,
+        # not by default -- and the cache is shared across boxes, so a wider
+        # run keeps everything a narrower one already fetched.
+        default: "57.60,11.75,57.85,12.15"
       tolerance:
         description: "Douglas-Peucker tolerance in degrees (0.0004 ≈ 40 m)"
         default: "0.0004"
@@ -32,7 +38,7 @@ permissions:
   contents: write
 
 env:
-  BBOX: ${{ inputs.bbox || '57.20,11.00,59.35,14.80' }}
+  BBOX: ${{ inputs.bbox || '57.60,11.75,57.85,12.15' }}
   TOLERANCE: ${{ inputs.tolerance || '0.0004' }}
   ENDPOINT: ${{ inputs.endpoint || 'https://overpass-api.de/api/interpreter' }}
   RESULT_BRANCH: barriers/refresh
