@@ -120,14 +120,18 @@ jobs:
       # request back into that shows one file and nothing else.
       - name: Push the result to a branch
         run: |
-          if git diff --quiet -- prep/barriers.geojson; then
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Stage first, then ask the index. git diff does not see an
+          # untracked file, so asking it about a file that did not exist
+          # before answers "unchanged" -- and the job passes having produced
+          # nothing at all, which is the worst way for this to fail.
+          git add prep/barriers.geojson
+          if git diff --cached --quiet -- prep/barriers.geojson; then
             echo "Geometrin är oförändrad — inget att granska." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -b "$RESULT_BRANCH"
-          git add prep/barriers.geojson
           git commit -m "Uppdatera vattengeometrin från OpenStreetMap
 
           Hämtad inom $BBOX, förenklad med tolerans $TOLERANCE.

@@ -88,12 +88,16 @@ def cache_path(cache_dir, query):
     return os.path.join(cache_dir, digest + ".json.gz")
 
 
-def overpass(query, cache_dir, retries=5, timeout=600):
+def overpass(query, cache_dir, retries=8, timeout=600):
     """One Overpass request, cached on disk and patient about being throttled.
 
     Raises QueryTooBig when the server says the query timed out or ran out of
     memory -- that is not a transient failure and retrying it unchanged only
     burns quota.
+
+    Eight attempts, not three: a Goteborg-sized run drew two 429s inside its
+    first three queries, so a full region will be throttled repeatedly and
+    patience is cheaper than a re-run.
     """
     path = cache_path(cache_dir, query) if cache_dir else None
     if path and os.path.exists(path):
