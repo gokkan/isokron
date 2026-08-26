@@ -1328,25 +1328,10 @@ function isDark() {
 }
 
 function styleFor(dark) {
-  const set = dark ? 'dark_all' : 'light_all';
-  return {
-    version: 8,
-    sources: {
-      carto: {
-        type: 'raster',
-        tiles: 'abc'.split('').map((h) =>
-          `https://${h}.basemaps.cartocdn.com/${set}/{z}/{x}/{y}@2x.png`),
-        tileSize: 256,
-        maxzoom: 18,
-        attribution: '© OpenStreetMap, © CARTO',
-      },
-    },
-    layers: [
-      { id: 'bg', type: 'background',
-        paint: { 'background-color': dark ? '#12151a' : '#eef1f4' } },
-      { id: 'carto', type: 'raster', source: 'carto' },
-    ],
-  };
+  // OpenFreeMap: vector tiles, no API key, no rate limit. CARTO's free
+  // basemaps started stamping "API KEY REQUIRED" across every tile, which is
+  // what a third party's goodwill looks like when it runs out.
+  return 'https://tiles.openfreemap.org/styles/' + (dark ? 'dark' : 'positron');
 }
 
 /* The palette lives in CSS, so switching the attribute is enough for the
@@ -1396,6 +1381,9 @@ async function boot() {
   if (map.keyboard && map.keyboard.disableRotation) map.keyboard.disableRotation();
   map.addControl(new maplibregl.NavigationControl({ showCompass: false }),
                  'bottom-right');
+  // The inline style declares no attribution, but the TileJSON behind the
+  // vector source does, and MapLibre picks it up once that resolves. The
+  // footnote in the panel is the copy we control, and it says the same.
   map.addControl(new maplibregl.AttributionControl({ compact: true }),
                  'bottom-right');
 

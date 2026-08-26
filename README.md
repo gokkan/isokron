@@ -156,12 +156,16 @@ länk för att öppna den i sin sammanfattning.
 
 Fem, alla medvetna:
 
-1. **Tidsfönstret är 05:45–12:15, inte 06:00–10:00.** Skjutreglaget går till
-   10:15 och den längsta horisonten är 120 minuter, så avgångar måste finnas
-   till 12:15 — annars kapas resultatet mot datakanten, vilket är precis den
-   hårda kant acceptanskriterierna förbjuder. Gränsen härleds ur `HORIZONS` i
-   `app.js`: lägger du till en längre horisont måste `--window-end` följa med,
-   annars trunkeras sena avgångar tyst.
+1. **Tidsfönstret är 05:00–22:00, inte 06:00–10:00.** Planen ville visa
+   morgonrusningen; kartan visar hela vardagen, och avgångsreglaget är det som
+   gör skillnaden synlig. Reglagets tak är horisontberoende — 21:45 vid
+   15 minuter, 20:00 vid 120 — eftersom resan måste rymmas i datat. Låser man
+   det vid det längsta fallet kastar man bort större delen av kvällen; låter
+   man bli att låsa det alls trunkeras sena avgångar tyst mot datakanten,
+   vilket är precis den hårda kant acceptanskriterierna förbjuder.
+
+   Taket för fönstret är 18 timmar och 12 minuter: `dep`/`arr` är Uint16
+   sekunder från fönstrets start. 17 timmar ryms, nattrafiken gör det inte.
 2. **Trip-medveten CSA.** Planens `arr[c.from] <= c.dep` tillåter byte mellan
    olika turer på noll sekunder. Klienten bär i stället en `boarded`-flagga per
    tur: att sitta kvar är gratis, att kliva på en ny tur kostar `MIN_CHANGE`
@@ -316,8 +320,13 @@ fortsätta därifrån. Mellanslag växlar play/paus.
 
 Temat bor i CSS-variabler, så panelen byter av sig själv när `data-theme`
 ändras. Canvasen och kartunderlaget måste sägas till separat — `readColors()`
-läser om paletten och `map.setStyle()` byter mellan CARTO Positron och Dark
-Matter. Utan explicit val följer sidan systemets inställning.
+läser om paletten och `map.setStyle()` byter mellan OpenFreeMaps positron och
+dark. Utan explicit val följer sidan systemets inställning.
+
+Kartunderlaget kom från CARTO till en början. De började stämpla
+*API KEY REQUIRED* tvärs över varje kakel, vilket är hur någon annans
+välvilja ser ut när den tar slut. OpenFreeMap kräver ingen nyckel, har både
+en ljus och en mörk stil, och byts ut på samma rad om det upprepas.
 
 Rökprovet laddar den riktiga sidan i Chromium, klickar på kartan och faller på
 minsta konsolfel. Det kräver `playwright-core` och en Chromium-build lokalt:
@@ -353,8 +362,8 @@ datatyp per array och klienten läser den, så det är en avgränsad ändring i
 ## Attribution
 
 Tidtabellsdata från Trafiklab / Samtrafiken, GTFS Regional, CC0. Kartunderlag
-© OpenStreetMap-bidragsgivare, © CARTO. Beräkningen bygger på tidtabell, inte
-faktisk trafik.
+© OpenStreetMap-bidragsgivare, via OpenFreeMap. Beräkningen bygger på
+tidtabell, inte faktisk trafik.
 
 Vattengeometrin i `prep/barriers.geojson` och `barriers.bin` är härledd ur
 OpenStreetMap och står under **ODbL** — en annan licens än den CC0-märkta
